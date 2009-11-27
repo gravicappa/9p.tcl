@@ -1,6 +1,6 @@
 package require vfs
 
-namespace eval ixp {
+namespace eval 9p {
 variable PORT 564
 variable VERSION "9P2000"
 
@@ -135,7 +135,6 @@ proc prep_cmd_encode {msg fmt} {
     lappend fmt_args \$$name
     lappend args $name
   }
-  #append code "DBG \"(enc) msg: $msg $fmt_fmt [join $fmt_args]\";\n"
   append code "binary format $fmt_fmt [join $fmt_args]"
   proc enc$msg [join [list tag $args]] $code
 }
@@ -319,7 +318,7 @@ proc send/recv {chan type to {from {}}} {
   uplevel 1 [list dec_msg $chan $type $tag $from]
 }
 
-proc init {chan} {
+proc init_session {chan} {
   global [namespace current]::session_vars
   init_ids tag $chan
   init_ids fid $chan
@@ -331,7 +330,7 @@ proc init {chan} {
   }
 }
 
-proc cleanup {chan} {
+proc cleanup_session {chan} {
   global [namespace current]::session_vars
   clear_ids tag $chan
   clear_ids fid $chan
@@ -347,7 +346,7 @@ proc start {chan} {
   if {[fconfigure $chan -encoding] != "binary"} { 
     return -code error "Channel $chan encoding is not binary."
   }
-  init $chan
+  init_session $chan
   fileevent $chan readable [list [namespace current]::recv_data $chan]
 
   set iounit [namespace current]::iounit/$chan
@@ -359,6 +358,11 @@ proc start {chan} {
   } else {
     return -code error "Unsupported version: $rver."
   }
+}
+
+proc stop {chan} {
+  cleanup_session $chan
+  fileevent $chan readable {}
 }
 
 ##
@@ -510,7 +514,7 @@ proc handle_blocking {chan fid self mode} {
   set fd(block) $mode
 }
 
-proc handle {chan fid command self args} {
+proc chan_handle {chan fid command self args} {
   set fd [namespace current]::file/$self
   global $fd
   switch $command {
@@ -526,7 +530,7 @@ proc handle {chan fid command self args} {
 proc chan_from_fid {chan fid mode} {
   global [namespace current]::chan_open_modes
   chan create $chan_open_modes($mode) \
-              [list [namespace current]::handle $chan $fid]
+              [list [namespace current]::chan_handle $chan $fid]
 }
 
 ##
@@ -675,16 +679,11 @@ proc read_dir {chan root_fid name {command ""}} {
   return $ret
 }
 
-proc stop {chan} {
-  cleanup $chan
-  fileevent $chan readable {}
-}
-
 #
 # VFS
 #
 
-proc vfs_access {chan root_fid name mode} {
+proc vfs_access {chan root_fid root name mode} {
   set fid [walk_fid $chan $root_fid $name]
   set ret 0
   if {$fid >= 0} {
@@ -692,21 +691,21 @@ proc vfs_access {chan root_fid name mode} {
                                       fqid_ver fqid_path fmode fatime
                                       fmtime flen fname fuid fgid fmuid}
     rm_id fid $fid $chan
-    DBG "(vfs/access) file.mode: $fmode mode: $mode"
+    #DBG "(vfs/access) file.mode: $fmode mode: $mode"
     set ret [expr {($fmode & $mode) == $mode}]
   } else {
   }
-  DBG "access: $ret"
+  #DBG "(vfs/access) ret: $ret"
   return $ret
 }
 
-proc vfs_createdirectory {chan root_fid name} {
+proc vfs_createdirectory {chan root_fid root name} {
   global [current namespace]::QDIR
   set fid [create_file chan $root_fid $name 0 [expr {0777 | $QDIR}]]
   rm_id fid $fid $chan
 }
 
-proc vfs_deletefile {chan root_fid name} {
+proc vfs_deletefile {chan root_fid root name} {
   set fid [walk_fid $chan $root_fid $name]
   if {$fid >= 0} {
     send/recv $chan [list $fid] {}
@@ -714,11 +713,11 @@ proc vfs_deletefile {chan root_fid name} {
   }
 }
 
-proc vfs_fileattributes {chan root_fid name {index {}} {value {}}} {
+proc vfs_fileattributes {chan root_fid root name {index {}} {value {}}} {
   return {}
 }
 
-proc vfs_matchindirectory {chan root_fid name pattern types} {
+proc vfs_matchindirectory {chan root_fid root name pattern types} {
   set show_dirs [vfs::matchDirectories $types]
   set show_files [vfs::matchFiles $types]
   global [namespace current]::DMDIR
@@ -730,12 +729,12 @@ proc vfs_matchindirectory {chan root_fid name pattern types} {
     switch [dict get $stat type] {
       file {
         if {$show_files} {
-          lappend ret $name
+          lappend ret $root
         }
       }
       directory {
         if {$show_dirs} {
-          lappend ret $name
+          lappend ret $root
         }
       }
     }
@@ -746,23 +745,23 @@ proc vfs_matchindirectory {chan root_fid name pattern types} {
       if {[string match $pattern $file]} {
         if {[expr {$type & $DMDIR}]} {
           if {$show_dirs} {
-            lappend ret [file join $name $file]
+            lappend ret [file join $root $file]
           }
         } elseif {$show_files} {
-          lappend ret [file join $name $file]
+          lappend ret [file join $root $file]
         }
       }
     }
   }
-  DBG "(match) ret: $ret"
+  #DBG "(vfs/match) ret: $ret"
   return $ret
 }
 
-proc vfs_open {chan root_fid name mode perm} {
+proc vfs_open {chan root_fid root name mode perm} {
   return [open_file $chan $root_fid $name $mode $perm]
 }
 
-proc vfs_removedirectory {chan root_fid name recursive} {
+proc vfs_removedirectory {chan root_fid root name recursive} {
   if {$recursive} {
     vfs_delete_file $chan $root_fid $name
   } else {
@@ -774,9 +773,9 @@ proc vfs_removedirectory {chan root_fid name recursive} {
   }
 }
 
-proc vfs_stat {chan root_fid name} {
+proc vfs_stat {chan root_fid root name} {
   global [namespace current]::DMDIR
-  DBG "(vfs/stat) name: '$name'"
+  #DBG "(vfs/stat) name: '$name'"
   set fid [walk_fid $chan $root_fid $name]
   set ret [list]
   if {$fid >= 0} {
@@ -794,17 +793,16 @@ proc vfs_stat {chan root_fid name} {
                   nlink 1 \
                   uid -1 \
                   gid -1\
-                  size $flen \
                   atime $fatime \
                   mtime $fmtime \
                   ctime $fmtime \
                   type $type]
-    DBG "(vfs_stat) name: $fname stat: $ret"
+    #DBG "(vfs/stat) name: $fname stat: $ret"
   }
   return $ret
 }
 
-proc vfs_utime {chan root_fid name actime mtime} {
+proc vfs_utime {chan root_fid root name actime mtime} {
   set fid [walk_fid $chan $root_fid $name]
   if {$fid >= 0} {
     set n1 [expr {2 + 2 + 4 + 1 + 4 + 8 + 4}]
@@ -820,27 +818,20 @@ proc vfs_utime {chan root_fid name actime mtime} {
 }
 
 proc vfs_cmd {chan root_fid cmd root rel path args} {
-  DBG "(vfs/cmd) cmd: $cmd rel: '$rel' path: '$path' root: '$root' args: '$args'"
-  eval [list vfs_$cmd $chan $root_fid $rel] $args
-# access {mode}
-# createdirectory
-# deletefile
-# fileattributes {?index? ?value?}
-# matchindirectory {pattern types}
-# open {mode perm}
-# removedirectory {recursive}
-# stat
-# utime {atime mtime}
+  #DBG "(vfs/cmd) cmd: $cmd"
+  #DBG "          root: '$root'"
+  #DBG "          rel: '$rel'"
+  #DBG "          path: '$path'"
+  #DBG "          args: '$args'"
+  eval [list vfs_$cmd $chan $root_fid $path $rel] $args
 }
 
 proc mount {chan path args} {
   set mount [namespace current]::mount/$path
   global $mount
   if {[info exists $mount]} {
-    DBG "Using existing"
     incr [set mount](refcount)
   } else {
-    DBG "Starting"
     set [set mount](refcount) 1 
     set [set mount](chan) $chan
   }
@@ -869,113 +860,4 @@ proc umount {path} {
     }
   }
 }
-}
-
-proc test_ed {} {
-  set data [ixp::encTversion 17 4096 9P2000]
-  ixp::decRversion [string range $data 1 end] {tag size proto}
-  puts "tag: '$tag'"
-  puts "size: '$size'"
-  puts "proto: '$proto'"
-}
-
-proc read_from_file {fd} {
-  set data [read $fd]
-  puts "DATA ([string length $data] bytes):"
-  puts "-"
-  puts "$data"
-  puts "-"
-  puts "END"
-  global done
-  set done 1
-}
-
-proc test_read {} {
-  set chan [socket localhost 9910]
-  fconfigure $chan -blocking 0 -encoding binary -translation binary
-  ixp::start $chan
-  set root_fid [ixp::attach $chan]
-  puts "root_fid: $root_fid"
-  set name fs/home/yoda/dev/tcl/README
-  set fd [ixp::open_file $chan $root_fid $name]
-  if {0} {
-    fconfigure $fd -blocking 0
-    fileevent $fd readable [list read_from_file $fd]
-
-    global done
-    puts "waiting for readable event"
-    vwait done
-  } else {
-    read_from_file $fd
-  }
-  close $fd
-  ixp::stop $chan
-  close $chan
-}
-
-proc write_to_file {fd data} {
-  puts -nonewline $fd $data
-  flush $fd
-  global done
-  set done 1
-}
-
-proc test {} {
-  set chan [socket localhost 9910]
-  fconfigure $chan -blocking 0 -encoding binary -translation binary
-  ixp::start $chan
-  set root_fid [ixp::attach $chan]
-  puts "root_fid: $root_fid"
-  set name fs/home/yoda/dev/tcl/README
-  set fd [ixp::open_file $chan $root_fid $name w 0]
-  set date [clock format [clock seconds] -format %Ec -locale system]
-  set data "($date) Preved und banzai! Yo-ho-ho!"
-  if {0} {
-    fconfigure $fd -blocking 0
-    fileevent $fd writable [list write_to_file $fd $data]
-
-    global done
-    puts "waiting for writable event"
-    vwait done
-  } else {
-    write_to_file $fd $data
-  }
-  close $fd
-  foreach i [ixp::read_dir $chan $root_fid "" {list %n %m}] {
-    lassign $i name mode
-    if {[expr {$mode & 0x80000000}]} {
-      puts "$mode $name/"
-    } else {
-      puts "$mode $name"
-    }
-  }
-  ixp::stop $chan
-  close $chan
-}
-
-proc test_mnt {} {
-  set chan [socket localhost 9910]
-  fconfigure $chan -blocking 0 -encoding binary -translation binary
-
-  ixp::mount $chan /srv
-  if {0} {
-    foreach f {/srv/ /srv/ctl /srv/fs/ /srv/fs/mnt} {
-      if {[file isdirectory $f]} {
-        puts "$f is a directory"
-      } else {
-        puts "$f is a file"
-      }
-      break
-    }
-  }
-  if {1} {
-    package require Tk
-    wm withdraw .
-    #tk_getOpenFile -initialdir /
-    tk_chooseDirectory -initialdir /srv/
-  }
-  #puts "file: [file isdirectory /srv/fs]"
-  #puts [glob /srv/fs/*]
-  ixp::umount /srv
-  close $chan
 }
