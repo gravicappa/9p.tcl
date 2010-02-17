@@ -1,5 +1,3 @@
-package require vfs
-
 namespace eval 9p {
 variable PORT 564
 variable VERSION "9P2000"
@@ -22,6 +20,7 @@ variable session_vars
 set session_vars {{set iounit 4096}
                   {set buf ""}
                   {{array set} pool {}}}
+variable store
 
 set Tmsg_fmt {
   Tversion "iS"
@@ -82,17 +81,6 @@ variable cmd_name
 proc DBG {msg} {
   puts stderr ";; $msg"
   flush stderr
-}
-
-proc named {args defaults} {
-  upvar 1 "" ""
-  array set "" $defaults
-  foreach {key value} $args {
-    if {![info exists ($key)]} {
-      error "bad option '$key', should be one of: [lsort [array names {}]]"
-    }
-    set ($key) $value
-  }
 }
 
 proc prep_cmd_numbers {commands} {
@@ -554,6 +542,17 @@ proc auth {chan user name code} {
   eval $cmd
 }
 
+proc named {args defaults} {
+  upvar 1 "" ""
+  array set "" $defaults
+  foreach {key value} $args {
+    if {![info exists ($key)]} {
+      error "bad option '$key', should be one of: [lsort [array names {}]]"
+    }
+    set ($key) $value
+  }
+}
+
 proc attach {chan args} {
   global [namespace current]::NOFID tcl_platform
 
@@ -884,7 +883,7 @@ proc mount {chan path args} {
   if {$fid >= 0} {
     set [set mount](root_fid) $fid
     ::vfs::filesystem mount -volume $path \
-                            [list [namespace current]::vfs_cmd $chan $fid]
+                      [list [namespace current]::vfs_cmd $chan $fid]
   }
 }
 
