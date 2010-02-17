@@ -708,6 +708,7 @@ proc vfs_access {chan root_fid root name mode} {
     #DBG "(vfs/access) file.mode: $fmode mode: $mode"
     set ret [expr {($fmode & $mode) == $mode}]
   } else {
+    error "No such file"
   }
   #DBG "(vfs/access) ret: $ret"
   return $ret
