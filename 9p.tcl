@@ -18,6 +18,7 @@ variable OEXEC 3
 variable OTRUNC 0x10
 variable ORCLOSE 0x40
 
+variable session_vars
 set session_vars {{set iounit 4096}
                   {set buf ""}
                   {{array set} pool {}}}
@@ -60,6 +61,7 @@ set Rmsg_fmt {
 set commands {version auth attach error flush walk 
               open create read write clunk remove stat wstat}
 
+variable open_modes
 array set open_modes [list r $OREAD \
                            r+ $ORDWR \
                            w $OWRITE \
@@ -67,6 +69,7 @@ array set open_modes [list r $OREAD \
                            a $OWRITE \
                            a+ $ORDWR]
 
+variable chan_open_modes
 array set chan_open_modes {r {read}
                            r+ {read write}
                            w {write}
@@ -137,6 +140,12 @@ proc prep_cmd_encode {msg fmt} {
   }
   append code "binary format $fmt_fmt [join $fmt_args]"
   proc enc$msg [join [list tag $args]] $code
+}
+
+proc dbg_hex_dump {data {prefix "hex: "}} {
+  binary scan $data H* hex
+  set l [string length $hex]
+  DBG "$prefix $hex"
 }
 
 proc dec_packet {fmt data vars} {
@@ -634,6 +643,9 @@ proc open_file {chan root_fid name {mode r} {perm 0644}} {
   global [namespace current]::open_modes
   set ret ""
   set binary ""
+  if {$mode eq ""} {
+    set mode r
+  }
   if {[string match *b $mode]} {
     set binary b
     set mode [string range $mode 0 end-1]
@@ -658,6 +670,7 @@ proc open_file {chan root_fid name {mode r} {perm 0644}} {
 
 proc read_dir {chan root_fid name {command ""}} {
   set f [open_file $chan $root_fid $name]
+  fconfigure $f -translation binary -encoding binary
   set ret [list]
   while {1} {
     set data [read $f]
@@ -667,11 +680,12 @@ proc read_dir {chan root_fid name {command ""}} {
     while {[string length $data]} {
       decstat $data {fsize ftype fdev fqid_type fqid_ver fqid_path fmode
                      fatime fmtime flen fname fuid fgid fmuid}
+      #DBG "read_dir flen: $flen name: $fname uid: $fuid"
       set data [string range $data [expr {$fsize + 2}] end]
       if {$command eq ""} {
         lappend ret $fname
       } else {
-        set map [list %n $fname %t $fqid_type %m $fmode]
+        set map [list %n "{$fname}" %t $fqid_type %m $fmode]
         lappend ret [eval [string map $map $command]]
       }
     }
@@ -753,7 +767,6 @@ proc vfs_matchindirectory {chan root_fid root name pattern types} {
       }
     }
   }
-  #DBG "(vfs/match) ret: $ret"
   return $ret
 }
 
@@ -775,7 +788,6 @@ proc vfs_removedirectory {chan root_fid root name recursive} {
 
 proc vfs_stat {chan root_fid root name} {
   global [namespace current]::DMDIR
-  #DBG "(vfs/stat) name: '$name'"
   set fid [walk_fid $chan $root_fid $name]
   set ret [list]
   if {$fid >= 0} {
@@ -792,7 +804,7 @@ proc vfs_stat {chan root_fid root name} {
                   mode [expr {$fmode & 0777}] \
                   nlink 1 \
                   uid -1 \
-                  gid -1\
+                  gid -1 \
                   atime $fatime \
                   mtime $fmtime \
                   ctime $fmtime \
@@ -826,6 +838,33 @@ proc vfs_cmd {chan root_fid cmd root rel path args} {
   eval [list vfs_$cmd $chan $root_fid $path $rel] $args
 }
 
+proc file_stat {mnt name} {
+  set mount [namespace current]::mount/$mnt
+  upvar #0 $mount m
+  set ret {}
+  if {[info exists m(chan)] && [info exists m(root_fid)] && $m(chan) ne ""} {
+    set chan $m(chan)
+    set root_fid $m(root_fid)
+    set fid [walk_fid $chan $root_fid $name]
+    if {$fid >= 0} {
+      send/recv $chan stat [list $fid] {total fsize ftype fdev fqid_type
+                                        fqid_ver fqid_path fmode fatime
+                                        fmtime flen fname fuid fgid fmuid}
+      rm_id fid $fid $chan
+      set ret [list -dev $fdev \
+                    -mode [expr {$fmode & 0777}] \
+                    -nlink 1 \
+                    -uid $fuid \
+                    -gid $fgid \
+                    -atime $fatime \
+                    -mtime $fmtime \
+                    -ctime $fmtime \
+                    -fmuid $fmuid]
+    }
+  }
+  return $ret
+}
+
 proc mount {chan path args} {
   set mount [namespace current]::mount/$path
   global $mount
@@ -838,10 +877,11 @@ proc mount {chan path args} {
   set ids [namespace current]::tag/$chan
   global $ids
   if {![info exists $ids]} {
-    ixp::start $chan
+    9p::start $chan
   }
   set fid [eval [list attach $chan] $args]
   if {$fid >= 0} {
+    set [set mount](root_fid) $fid
     ::vfs::filesystem mount -volume $path \
                             [list [namespace current]::vfs_cmd $chan $fid]
   }
@@ -861,3 +901,5 @@ proc umount {path} {
   }
 }
 }
+
+package provide 9p 0.1
