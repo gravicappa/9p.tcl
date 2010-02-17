@@ -10,17 +10,17 @@ variable DMEXCL 0x20000000
 variable DMTMP 0x04000000
 variable QDIR 0x80
 variable OREAD 0
-variable OWRITE 1 
+variable OWRITE 1
 variable ORDWR 2
 variable OEXEC 3
 variable OTRUNC 0x10
 variable ORCLOSE 0x40
 
 variable session_vars
-set session_vars {{set iounit 4096}
-                  {set buf ""}
-                  {{array set} pool {}}}
-variable store
+set session_vars {{iounit 4096}
+                  {buf ""}}
+variable _
+variable mount
 
 set Tmsg_fmt {
   Tversion "iS"
@@ -57,7 +57,7 @@ set Rmsg_fmt {
   Rwstat ""
 }
 
-set commands {version auth attach error flush walk 
+set commands {version auth attach error flush walk
               open create read write clunk remove stat wstat}
 
 variable open_modes
@@ -109,7 +109,7 @@ proc prep_cmd_encode {msg fmt} {
     set name item$i
     set t [string index $fmt $i]
     switch $t {
-      S { 
+      S {
         append code "set $name \[encoding convertto utf-8 \$$name\];\n"
         append code "set bytes$i \[string length \$$name\];\n"
         append fmt_fmt "sa\$\{bytes${i}\}"
@@ -159,7 +159,7 @@ proc dec_packet {fmt data vars} {
         set end [expr {$s + $len - 1}]
         set f a$len
       }
-      R { 
+      R {
         set end [string length $data]
         set f a*
       }
@@ -201,67 +201,58 @@ proc prep_all_cmd_serialize {Tmsg_fmt Rmsg_fmt} {
 prep_all_cmd_serialize $Tmsg_fmt $Rmsg_fmt
 
 proc init_ids {name chan} {
-  set ids [namespace current]::$name/$chan
-  global $ids
-  set $ids [list]
+  global [namespace current]::_
+  set _($name/$chan) [list]
 }
 
 proc clear_ids {name chan} {
-  set ids [namespace current]::$name/$chan
-  global $ids
-  unset $ids 
+  global [namespace current]::_
+  unset -nocomplain _($name/$chan)
 }
 
 proc new_id {name chan} {
-  set ids [namespace current]::$name/$chan
-  global $ids
+  global [namespace current]::_
   set i 0
   set tag {}
-  foreach a [set $ids] {
+  foreach a $_($name/$chan) {
     if {$a != 0xffffffff} {
       for {set j 0} {$j < 32 && [expr {$a & (1 << $j)}]} {incr j} {}
-      lset $ids $i [expr {$a | (1 << $j)}]
+      lset _($name/$chan) $i [expr {$a | (1 << $j)}]
       set tag [expr {($i * 32) + $j}]
     }
     incr i
   }
   if {$tag == {}} {
     set tag [expr {($i * 32)}]
-    lappend $ids 1
+    lappend _($name/$chan) 1
   }
   return $tag
 }
 
 proc rm_id {name tag chan} {
-  set ids [namespace current]::$name/$chan
-  global $ids
+  global [namespace current]::_
   set i [expr {$tag >> 32}]
   set j [expr {$tag & 0xffffffff}]
-  set a [lindex [set $ids] $i]
-  lset $ids $i [expr {$a & ~(1 << $j)}]
+  set a [lindex $_($name/$chan) $i]
+  lset _($name/$chan) $i [expr {$a & ~(1 << $j)}]
 }
 
 proc read_packet {nmsg chan} {
-  set buf [namespace current]::buf/$chan
-  set pool [namespace current]::pool/$chan
-  global $buf $pool
-  set msg [string range [set $buf] 0 $nmsg] 
-  set $buf [string range [set $buf] $nmsg end]
+  global [namespace current]::_
+  set msg [string range $_($chan/buf) 0 $nmsg]
+  set _($chan/buf) [string range $_($chan/buf) $nmsg end]
   binary scan $msg iu1csu1 msize type tag
-  array set $pool [list $tag $msg]
+  set _($chan/pool/$tag) $msg
 }
 
 proc recv_data {chan} {
-  set buf [namespace current]::buf/$chan
-  set iounit [namespace current]::iounit/$chan
-  global $iounit $buf
+  global [namespace current]::_
   if {![eof $chan]} {
-    set data [read $chan [set $iounit]]
+    set data [read $chan $_($chan/iounit)]
     if {[string length $data] > 0} {
-      append $buf $data
-      while {[string length [set $buf]] >= 7} {
-        set nbuf [string length [set $buf]]
-        binary scan [set $buf] iu1 nmsg
+      append _($chan/buf) $data
+      while {[set nbuf [string length $_($chan/buf)]] >= 7} {
+        binary scan $_($chan/buf) iu1 nmsg
         if {$nmsg <= $nbuf} {
           read_packet $nmsg $chan
         } else {
@@ -276,11 +267,11 @@ proc recv_data {chan} {
 }
 
 proc get_msg {tag chan} {
-  set pool [namespace current]::pool/$chan
-  global $pool
-  vwait [set pool]($tag)
-  set msg [set [set pool]($tag)]
-  unset [set pool]($tag)
+  global [namespace current]::_
+  set _($chan/pool/$tag) lalala
+  vwait [namespace current]::_($chan/pool/$tag)
+  set msg $_($chan/pool/$tag)
+  unset _($chan/pool/$tag)
   return $msg
 }
 
@@ -316,42 +307,38 @@ proc send/recv {chan type to {from {}}} {
 }
 
 proc init_session {chan} {
-  global [namespace current]::session_vars
+  global [namespace current]::session_vars [namespace current]::_
   init_ids tag $chan
   init_ids fid $chan
   foreach i $session_vars {
-    lassign $i setter name value
-    set var [namespace current]::$name/$chan
-    global $var
-    eval $setter $var [list $value]
+    lassign $i name value
+    set _($chan/$name) $value
   }
 }
 
 proc cleanup_session {chan} {
-  global [namespace current]::session_vars
+  global [namespace current]::session_vars [namespace current]::_
   clear_ids tag $chan
   clear_ids fid $chan
   foreach i $session_vars {
-    lassign $i setter name value
-    set v [namespace current]::$name/$chan
-    global $v
-    unset $v
+    lassign $i name value
+    unset _($chan/$name)
   }
+  array unset _ $chan/*
 }
 
 proc start {chan} {
-  if {[fconfigure $chan -encoding] != "binary"} { 
+  if {[fconfigure $chan -encoding] != "binary"} {
     return -code error "Channel $chan encoding is not binary."
   }
   init_session $chan
   fileevent $chan readable [list [namespace current]::recv_data $chan]
 
-  set iounit [namespace current]::iounit/$chan
-  global [namespace current]::VERSION $iounit
+  global [namespace current]::VERSION [namespace current]::_
 
-  send/recv $chan version [list [set $iounit] $VERSION] {riounit rver}
+  send/recv $chan version [list $_($chan/iounit) $VERSION] {riounit rver}
   if {$rver == $VERSION} {
-    set $iounit [expr {min([set $iounit], $riounit)}]
+    set _($chan/iounit) [expr {min($_($chan/iounit), $riounit)}]
   } else {
     return -code error "Unsupported version: $rver."
   }
@@ -364,12 +351,11 @@ proc stop {chan} {
 
 ##
 ## CHAN
-## 
+##
 
 proc handle_initialize {chan fid self mode} {
   upvar $self fd
-  set iounit [namespace current]::iounit/$chan
-  global $iounit
+  global [namespace current]::_
 
   set hdr [expr {4 + 1 + 2 + 4}]
   array set fd {off 0
@@ -379,8 +365,8 @@ proc handle_initialize {chan fid self mode} {
                 watch_write 0
                 watch_read 0}
   set fd(mode) $mode
-  set fd(iounit) [expr {[set $iounit] - $hdr}]
-  return {initialize finalize watch read write seek configure cget cgetall 
+  set fd(iounit) [expr {$_($chan/iounit) - $hdr}]
+  return {initialize finalize watch read write seek configure cget cgetall
           blocking}
 }
 
@@ -410,7 +396,7 @@ proc read_file {chan fid self count} {
   append fd(inbuf) $data
   set nread [string length $data]
   incr fd(off) $nread
-  if {$fd(watch_read)} { 
+  if {$fd(watch_read)} {
     after 1 [list chan postevent $self read]
   }
   return $nread
@@ -457,7 +443,7 @@ proc write_file {chan fid self off data} {
     incr fd(off) $count
     incr written $count
   }
-  if {$fd(watch_write)} { 
+  if {$fd(watch_write)} {
     after 1 [list chan postevent $self write]
   }
   return [expr {min($written, [string length $data])}]
@@ -531,8 +517,8 @@ proc chan_from_fid {chan fid mode} {
 }
 
 ##
-## COMMANDS 
-## 
+## COMMANDS
+##
 
 proc auth {chan user name code} {
   set afid [new_id fid $chan]
@@ -574,8 +560,8 @@ proc attach {chan args} {
 }
 
 proc walk {chan from_fid fid path} {
-  global [namespace current]::iounit/$chan
-  set iounit [set [namespace current]::iounit/$chan]
+  global [namespace current]::_
+  set iounit $_($chan/iounit)
   set hdrsize [expr {4 + 1 + 2 + 4 + 4 + 2}]
   set size 0
   set num 0
@@ -739,7 +725,7 @@ proc vfs_matchindirectory {chan root_fid root name pattern types} {
   #DBG "(match) dirs: $show_dirs files: $show_files"
   if {$pattern eq ""} {
     set stat [vfs_stat $chan $root_fid $name]
-    set type 
+    set type
     switch [dict get $stat type] {
       file {
         if {$show_files} {
@@ -752,7 +738,7 @@ proc vfs_matchindirectory {chan root_fid root name pattern types} {
         }
       }
     }
-    lappend ret 
+    lappend ret
   } else {
     foreach ent [read_dir $chan $root_fid $name {list %n %m}] {
       lassign $ent file type
@@ -824,7 +810,7 @@ proc vfs_utime {chan root_fid root name actime mtime} {
                                  $actime $mtime
                                  0xffffffff 0xffffffff
                                  0 0 0 0]
-    send/recv $chan wstat [list $fid $buf] 
+    send/recv $chan wstat [list $fid $buf]
     rm_id fid $fid $chan
   }
 }
@@ -866,36 +852,32 @@ proc file_stat {mnt name} {
 }
 
 proc mount {chan path args} {
-  set mount [namespace current]::mount/$path
-  global $mount
-  if {[info exists $mount]} {
-    incr [set mount](refcount)
+  global [namespace current]::mount [namespace current]::_
+  if {[info exists mount($path/refcount)]} {
+    incr mount($path/refcount)
   } else {
-    set [set mount](refcount) 1 
-    set [set mount](chan) $chan
+    set mount($path/refcount) 1
+    set mount($path/chan) $chan
   }
-  set ids [namespace current]::tag/$chan
-  global $ids
-  if {![info exists $ids]} {
+  if {![info exists _(tag/$chan)]} {
     9p::start $chan
   }
   set fid [eval [list attach $chan] $args]
   if {$fid >= 0} {
-    set [set mount](root_fid) $fid
+    set mount($path/root_fid) $fid
     ::vfs::filesystem mount -volume $path \
                       [list [namespace current]::vfs_cmd $chan $fid]
   }
 }
 
 proc umount {path} {
-  set mount [namespace current]::mount/$path
-  global $mount
-  if {[info exists $mount]} {
-    if {[set [set mount](refcount)] > 0} {
-      incr [set mount](refcount) -1
-      if {[set [set mount](refcount)] eq 0} {
-        stop [set [set mount](chan)]
-        unset $mount
+  global [namespace current]::mount
+  if {[info exists mount($path/refcount)]} {
+    if {$mount($path/refcount) > 0} {
+      incr mount($path/refcount) -1
+      if {$mount($path/refcount) eq 0} {
+        stop $mount($path/chan)
+        array unset mount $path/*
       }
     }
   }
@@ -903,3 +885,4 @@ proc umount {path} {
 }
 
 package provide 9p 0.1
+
