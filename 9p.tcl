@@ -1,888 +1,954 @@
-namespace eval 9p {
-variable PORT 564
-variable VERSION "9P2000"
-
-variable NOTAG 0xffff
-variable NOFID 0xffffffff
-variable DMDIR 0x80000000
-variable DMAPPEND 0x40000000
-variable DMEXCL 0x20000000
-variable DMTMP 0x04000000
-variable QDIR 0x80
-variable OREAD 0
-variable OWRITE 1
-variable ORDWR 2
-variable OEXEC 3
-variable OTRUNC 0x10
-variable ORCLOSE 0x40
-
-variable session_vars
-set session_vars {{iounit 4096}
-                  {buf ""}}
-variable _
-variable mount
-
-set Tmsg_fmt {
-  Tversion "iS"
-  Tauth "iSS"
-  Terror ""
-  Tflush "s"
-  Tattach "iiSS"
-  Twalk "iisR"
-  Topen "ic"
-  Tcreate "iSic"
-  Tread "iwi"
-  Twrite "iwD"
-  Tclunk "i"
-  Tremove "i"
-  Tstat "i"
-  Twstat "sR"
+proc TODO: args {
+  puts stderr "TODO: $args"
 }
 
-set Rmsg_fmt {
-  Rversion "iS"
-  Rauth "ciw"
-  Rerror "S"
-  Rflush ""
-  Rattach "ciw"
-  Rwalk "R"
-  Ropen "csii"
-  Rcreate "csii"
-  Rread "D"
-  Rwrite "i"
-  Rclunk ""
-  Rremove ""
-  Rstat "sssiciwiiiwSSSS"
-  stat "ssiciwiiiwSSSS"
-  Rwstat ""
+array set 9msg_fmt {
+  hdr {u4 size u1 type u2 tag}
+  stat {u2 size u2 type u4 dev qid qid u4 mode u4 atime u4 mtime u8 length
+        s name s uid s gid s muid}
+  Tversion {u4 msize s version}
+  Rversion {u4 msize s version}
+  Tauth {u4 afid s uname s aname}
+  Rauth {qid aqid}
+  Terror {}
+  Rerror {s ename}
+  Tflush {u2 oldtag}
+  Rflush {}
+  Tattach {u4 fid u4 afid s uname s aname}
+  Rattach {qid qid}
+  Twalk {u4 fid u4 newfid s* wname}
+  Rwalk {qid* wqid}
+  Topen {u4 fid u1 mode}
+  Ropen {qid qid u4 iounit}
+  Tcreate {u4 fid s name u4 perm u1 mode}
+  Rcreate {qid qid u4 iounit}
+  Tread {u4 fid u8 offset u4 count}
+  Rread {d4 data}
+  Twrite {u4 fid u8 offset d4 data}
+  Rwrite {u4 count}
+  Tclunk {u4 fid}
+  Rclunk {}
+  Tremove {u4 fid}
+  Rremove {}
+  Tstat {u4 fid}
+  Rstat {d2 stat}
+  Twstat {u4 fid stat stat}
+  Rwstat {}
 }
 
-set commands {version auth attach error flush walk
-              open create read write clunk remove stat wstat}
+set 9msg_order {version auth attach error flush walk open create read write
+                clunk remove stat wstat}
+array set 9mapping {}
+array set 9ctx {}
 
-variable open_modes
-array set open_modes [list r $OREAD \
-                           r+ $ORDWR \
-                           w $OWRITE \
-                           w+ $ORDWR \
-                           a $OWRITE \
-                           a+ $ORDWR]
-
-variable chan_open_modes
-array set chan_open_modes {r {read}
-                           r+ {read write}
-                           w {write}
-                           w+ {read write}
-                           a {write}
-                           a+ {read write}}
-
-variable cmd_name
-
-proc DBG {msg} {
-  puts stderr ";; $msg"
-  flush stderr
-}
-
-proc prep_cmd_numbers {commands} {
+proc 9init_msgs {} {
+  global 9msg_fmt 9msg_order 9mapping
   set i 100
-  foreach c $commands {
-    foreach prefix {T R} {
-      set cmd_name($i) $prefix$c
-      variable $prefix$c
-      set $prefix$c $i
-      incr i
+  foreach m $9msg_order {
+    set 9msg_fmt($i) $9msg_fmt(T$m)
+    set 9mapping(T$m) $i
+    set 9mapping($i) T$m
+    incr i
+    set 9msg_fmt($i) $9msg_fmt(R$m)
+    set 9mapping(R$m) $i
+    set 9mapping($i) R$m
+    incr i
+  }
+}
+
+proc 9msg_number {key} {
+  global 9mapping
+  return [expr {([string is integer $key]) ? $key : $9mapping($key)}]
+}
+
+9init_msgs
+
+array set 9p {
+  PORT 564
+  VERSION "9P2000"
+
+  NOTAG 0xffff
+  NOFID 0xffffffff
+  DMDIR 0x80000000
+  DMAPPEND 0x40000000
+  DMEXCL 0x20000000
+  DMTMP 0x04000000
+  QDIR 0x80
+  OREAD 0
+  OWRITE 1
+  ORDWR 2
+  OEXEC 3
+  OTRUNC 0x10
+  ORCLOSE 0x40
+}
+
+set 9session_vars {msize 4096
+                   buf ""
+                   .tag {}
+                   .fid {}}
+
+array set 9open_modes [list r $9p(OREAD) \
+                            r+ $9p(ORDWR) \
+                            w $9p(OWRITE) \
+                            w+ $9p(ORDWR) \
+                            a $9p(OWRITE) \
+                            a+ $9p(ORDWR)]
+
+array set 9chan_open_modes {r {read}
+                            r+ {read write}
+                            w {write}
+                            w+ {read write}
+                            a {write}
+                            a+ {read write}}
+
+set 9log_tags {connection !data dbg}
+
+proc puts_log {tag msg} {
+  global 9log_tags
+  if {[lsearch $9log_tags $tag] >= 0} {
+    puts stderr "# $tag: $msg"
+    flush stderr
+  }
+}
+
+proc 9bin_read {stream fmt len var} {
+  upvar 1 $var x
+  upvar 1 $stream s
+  set end [expr {$s(off) + $len}]
+  switch -- $fmt {
+    * {set x [string range $s(buf) $s(off) $end-1]}
+    default {binary scan [string range $s(buf) $s(off) $end-1] $fmt x}
+  }
+  set s(off) $end
+}
+
+proc 9read_field {stream type var} {
+  upvar 1 $var ret
+  upvar 1 $stream s
+  switch -- $type {
+    u1 {9bin_read s cu1 1 ret}
+    u2 {9bin_read s su1 2 ret}
+    u4 {9bin_read s iu1 4 ret}
+    u8 {9bin_read s wu1 8 ret}
+    qid {
+      9bin_read s cu1 1 mode
+      9bin_read s iu1 4 version
+      9bin_read s wu1 8 path
+      set ret [list $mode $version $path]
     }
-  }
-}
-
-prep_cmd_numbers $commands
-
-proc prep_cmd_encode {msg fmt} {
-  variable $msg
-  set len [string length $fmt]
-  set args [list]
-  set code [list]
-  set fmt_fmt "cs"
-  set fmt_args [list [set $msg] \$tag]
-
-  for {set i 0} {$i < $len} {incr i} {
-    set name item$i
-    set t [string index $fmt $i]
-    switch $t {
-      S {
-        append code "set $name \[encoding convertto utf-8 \$$name\];\n"
-        append code "set bytes$i \[string length \$$name\];\n"
-        append fmt_fmt "sa\$\{bytes${i}\}"
-        lappend fmt_args \$bytes$i
+    d2 - s {
+      9bin_read s su1 2 len
+      9bin_read s * $len ret
+      if {$type eq "s"} {
+        catch {set ret [encoding convertfrom utf-8 $ret]}
       }
-      D {
-        append code "set bytes$i \[string length \$$name\];\n"
-        append fmt_fmt "ia\$\{bytes${i}\}"
-        lappend fmt_args \$bytes$i
-      }
-      R { append fmt_fmt "a*" }
-      default { append fmt_fmt $t }
     }
-    lappend fmt_args \$$name
-    lappend args $name
-  }
-  append code "binary format $fmt_fmt [join $fmt_args]"
-  proc enc$msg [join [list tag $args]] $code
-}
-
-proc dbg_hex_dump {data {prefix "hex: "}} {
-  binary scan $data H* hex
-  set l [string length $hex]
-  DBG "$prefix $hex"
-}
-
-proc dec_packet {fmt data vars} {
-  #DBG "dec_packet {$fmt} {$data} {$vars}"
-  set s 0
-  foreach t $fmt v $vars {
-    upvar $v var
-    set f $t
-    switch $t {
-      cu1 { set end $s }
-      su1 { set end [expr {$s + 1}] }
-      iu1 { set end [expr {$s + 3}] }
-      wu1 { set end [expr {$s + 7}] }
-      D {
-        binary scan [string range $data $s [expr {$s + 3}]] iu1 len
-        incr s 4
-        set end [expr {$s + $len - 1}]
-        set f a$len
-      }
-      S - d {
-        binary scan [string range $data $s [expr {$s + 1}]] su1 len
-        incr s 2
-        set end [expr {$s + $len - 1}]
-        set f a$len
-      }
-      R {
-        set end [string length $data]
-        set f a*
-      }
-      default { return -code error "Type $t is unsupported" }
+    d4 {
+      9bin_read s iu1 4 len
+      9bin_read s * $len ret
     }
-    binary scan [string range $data $s $end] $f var
-    if {$t == "S"} {
-      set var [encoding convertfrom utf-8 $var]
-    }
-    set s [expr {$end + 1}]
-  }
-}
-
-proc prep_cmd_decode {msg fmt} {
-  set i 0
-  set f [list]
-  set len [string length $fmt]
-  foreach t [split $fmt {}] {
-    if {$t ne ""} {
-      switch $t {
-        c - s - i - w { append t u1 }
+    qid* {
+      9bin_read s su1 2 n
+      set ret {}
+      for {set i 0} {$i < $n} {incr i} {
+        9read_field s qid x
+        lappend ret $x
       }
-      lappend f $t
     }
-  }
-  interp alias {} [namespace current]::dec$msg \
-               {} [namespace current]::dec_packet $f
-}
-
-proc prep_all_cmd_serialize {Tmsg_fmt Rmsg_fmt} {
-  foreach {msg fmt} $Tmsg_fmt {
-    prep_cmd_encode $msg $fmt
-  }
-  foreach {msg fmt} $Rmsg_fmt {
-    prep_cmd_decode $msg $fmt
+    s* {
+      9bin_read s su1 2 n
+      set ret {}
+      for {set i 0} {$i < $n} {incr i} {
+        9read_field s s x
+        lappend ret $x
+      }
+    }
+    default {error "Type $type is unsupported"}
   }
 }
 
-prep_all_cmd_serialize $Tmsg_fmt $Rmsg_fmt
-
-proc init_ids {name chan} {
-  global [namespace current]::_
-  set _($name/$chan) [list]
+proc 9dec_msg {type data var} {
+  global 9msg_fmt
+  upvar 1 $var msg
+  set stream(off) 0
+  set stream(buf) $data
+  foreach {t key} $9msg_fmt($type) {
+    9read_field stream $t msg($key)
+  }
 }
 
-proc clear_ids {name chan} {
-  global [namespace current]::_
-  unset -nocomplain _($name/$chan)
+proc 9enc_field {type value} {
+  set buf {}
+  switch -- $type {
+    u1 {append buf [binary format cu1 $value]}
+    u2 {append buf [binary format su1 $value]}
+    u4 {append buf [binary format iu1 $value]}
+    u8 {append buf [binary format wu1 $value]}
+    qid {
+      append buf [9enc_field u1 [lindex $value 0]]
+      append buf [9enc_field u4 [lindex $value 1]]
+      append buf [9enc_field u8 [lindex $value 2]]
+    }
+    s {
+      append buf [binary format su1 [string length $value]]
+      set s $value
+      catch {set s [encoding convertto utf-8 $s]}
+      append buf $s
+    }
+    qid* {
+      append buf [9enc_field u2 [llength $value]]
+      foreach x $value {
+        append buf [9enc_field qid $x]
+      }
+    }
+    s* {
+      append buf [9enc_field u2 [llength $value]]
+      foreach x $value {
+        append buf [9enc_field s $x]
+      }
+    }
+    d2 {
+      append buf [binary format su1 [string length $value]]
+      append buf $value
+    }
+    d4 {
+      append buf [binary format iu1 [string length $value]]
+      append buf $value
+    }
+    default {error "Type $type is unsupported"}
+  }
+  return $buf
 }
 
-proc new_id {name chan} {
-  global [namespace current]::_
+proc 9enc_msg {var} {
+  global 9msg_fmt
+  upvar 1 $var msg
+  set buf {}
+  foreach {t key} $9msg_fmt($msg(type)) {
+    append buf [9enc_field $t $msg($key)]
+  }
+  set size [expr {[string length $buf] + 7}]
+  return [binary format iu1cu1su1 $size $msg(type) $msg(tag)]$buf
+}
+
+proc 9init_ids {name chan} {
+  global 9ctx
+  set 9ctx($chan/.$name) {}
+}
+
+proc 9clear_ids {name chan} {
+  global 9ctx
+  unset -nocomplain 9ctx($chan/.$name)
+}
+
+proc 9new_id {name chan} {
+  global 9ctx
   set i 0
   set tag {}
-  foreach a $_($name/$chan) {
+  foreach a $9ctx($chan/.$name) {
     if {$a != 0xffffffff} {
       for {set j 0} {$j < 32 && [expr {$a & (1 << $j)}]} {incr j} {}
-      lset _($name/$chan) $i [expr {$a | (1 << $j)}]
-      set tag [expr {($i * 32) + $j}]
+      lset 9ctx($chan/.$name) $i [expr {$a | (1 << $j)}]
+      set tag [expr {($i << 5) + $j}]
+      break
     }
     incr i
   }
   if {$tag == {}} {
-    set tag [expr {($i * 32)}]
-    lappend _($name/$chan) 1
+    set tag [expr {($i << 5)}]
+    lappend 9ctx($chan/.$name) 1
   }
   return $tag
 }
 
-proc rm_id {name tag chan} {
-  global [namespace current]::_
+proc 9rm_id {name tag chan} {
+  global 9ctx
   set i [expr {$tag >> 32}]
   set j [expr {$tag & 0xffffffff}]
-  set a [lindex $_($name/$chan) $i]
-  lset _($name/$chan) $i [expr {$a & ~(1 << $j)}]
+  set a [lindex $9ctx($chan/.$name) $i]
+  lset 9ctx($chan/.$name) $i [expr {$a & ~(1 << $j)}]
 }
 
-proc read_packet {nmsg chan} {
-  global [namespace current]::_
-  set msg [string range $_($chan/buf) 0 $nmsg]
-  set _($chan/buf) [string range $_($chan/buf) $nmsg end]
-  binary scan $msg iu1csu1 msize type tag
-  set _($chan/pool/$tag) $msg
-}
-
-proc recv_data {chan} {
-  global [namespace current]::_
-  if {![eof $chan]} {
-    set data [read $chan $_($chan/iounit)]
-    if {[string length $data] > 0} {
-      append _($chan/buf) $data
-      while {[set nbuf [string length $_($chan/buf)]] >= 7} {
-        binary scan $_($chan/buf) iu1 nmsg
-        if {$nmsg <= $nbuf} {
-          read_packet $nmsg $chan
-        } else {
-          break
-        }
-      }
-    }
+proc 9process_packet {chan} {
+  global 9ctx
+  set buf $9ctx($chan/buf)
+  binary scan $buf iu1 msize
+  if {$msize > [string length $buf] || $msize < 7} {
+    # error
+    return
+  }
+  set msg [string range $buf 0 $msize]
+  set 9ctx($chan/buf) [string range $buf $msize end]
+  binary scan $msg iu1csu1 _ _ tag
+  9rm_id tag $tag $chan
+  if {[info exists 9ctx($chan/handler/$tag)]} {
+    uplevel #0 $9ctx($chan/handler/$tag) [list $msg]
   } else {
-    DBG "Connection closed."
-    cleanup $fd
+    TODO: do something then tag handler is not set
+    #set 9ctx($chan/pool/$tag) $msg
   }
 }
 
-proc get_msg {tag chan} {
-  global [namespace current]::_
-  set _($chan/pool/$tag) lalala
-  vwait [namespace current]::_($chan/pool/$tag)
-  set msg $_($chan/pool/$tag)
-  unset _($chan/pool/$tag)
-  return $msg
+proc 9recv_msg {chan} {
+  global 9ctx
+  while 1 {
+    if {[eof $chan] || [catch {set buf [read $chan $9ctx($chan/msize)]}]} {
+      puts_log connection "Connection unexpectedly closed."
+      return -1
+    }
+    if {$buf eq ""} {
+      return 0
+    }
+    puts_log data "buf([string length $buf]): [hexdump $buf]"
+    set buf [append 9ctx($chan/buf) $buf]
+    binary scan $buf iu1 msgsize
+    if {$msgsize <= [string length $buf]} {
+      set 9ctx($chan/buf) $buf
+      return 1
+    }
+  }
 }
 
-proc send_msg {chan type to} {
-  set tag [new_id tag $chan]
-  set data [eval [list encT$type $tag] $to]
-  set size [string length $data]
-  set buf [binary format i [expr {$size + 4}]]
-  append buf $data
+proc 9recv_data {chan} {
+  switch -- [9recv_msg $chan] {
+    -1 {return false}
+    0 {return true}
+    1 {9process_packet $chan}
+  }
+}
+
+proc 9process_msg {msgvar chan exptype buf} {
+  global 9ctx 9msg_fmt
+  upvar 1 $msgvar msg
+  binary scan $buf iu1csu1 size type tag
+  unset -nocomplain 9ctx($chan/handler/$tag)
+  if {![info exists 9msg_fmt($type)]} {
+    return -code error "Unknown message type $type"
+  }
+  if {$exptype + 1 != $type && $type != [9msg_number Rerror]} {
+    return -code error "Unexpected message type $type for $exptype"
+  }
+  9dec_msg $type [string range $buf 7 end] msg
+  set msg(chan) $chan
+  set msg(type) $type
+  set msg(tag) $tag
+}
+
+proc 9recv_async {msgvar chan exptype code buf} {
+  9process_msg msg $chan $exptype $buf
+  eval $code
+}
+
+proc 9sync_handler {msgvar data code} {
+  set c [list array set $msgvar $data]\n$code
+  uplevel 2 $c
+}
+
+proc 9send_msg {msgvar chan sync code} {
+  global 9ctx 9msg_fmt
+  upvar 1 $msgvar m
+  set m(tag) [9new_id tag $chan]
+  set m(type) [9msg_number $m(type)]
+  set buf [9enc_msg m]
+  set code1 $code
+  if {$sync} {
+    set code1 [string map [list %M $msgvar] {
+      global 9ctx
+      set 9ctx($%M(chan)/var/$%M(tag)) [array get %M]
+    }]
+  }
+  set key $chan/handler/$m(tag)
+  set 9ctx($key) [list 9recv_async $msgvar $chan $m(type) $code1]
   puts -nonewline $chan $buf
   flush $chan
-  return $tag
-}
-
-proc dec_msg {chan type tag from} {
-  set ret [get_msg $tag $chan]
-  rm_id tag $tag $chan
-  binary scan $ret iu1csu1 rsize rtype rtag
-  if {$rtype == [set [namespace current]::R$type]} {
-    uplevel 1 [list decR$type [string range $ret 7 end] $from]
-  } elseif {$rtype == [set [namespace current]::Rerror]} {
-    decRerror [string range $ret 7 end] msg
-    return -code error "Error: $msg"
-  } else {
-    return -code error "Wrong server responce (type: $rtype)"
+  if {!$sync} {
+    return $m(tag)
   }
-  return $rsize
+  set 9ctx($chan/var/$m(tag)) {}
+  vwait 9ctx($chan/var/$m(tag))
+  set ret $9ctx($chan/var/$m(tag))
+  unset -nocomplain 9ctx($chan/var/$m(tag))
+  return [9sync_handler $msgvar $ret $code]
 }
 
-proc send/recv {chan type to {from {}}} {
-  set tag [send_msg $chan $type $to]
-  uplevel 1 [list dec_msg $chan $type $tag $from]
-}
-
-proc init_session {chan} {
-  global [namespace current]::session_vars [namespace current]::_
-  init_ids tag $chan
-  init_ids fid $chan
-  foreach i $session_vars {
-    lassign $i name value
-    set _($chan/$name) $value
-  }
-}
-
-proc cleanup_session {chan} {
-  global [namespace current]::session_vars [namespace current]::_
-  clear_ids tag $chan
-  clear_ids fid $chan
-  foreach i $session_vars {
-    lassign $i name value
-    unset _($chan/$name)
-  }
-  array unset _ $chan/*
-}
-
-proc start {chan} {
-  if {[fconfigure $chan -encoding] != "binary"} {
-    return -code error "Channel $chan encoding is not binary."
-  }
-  init_session $chan
-  fileevent $chan readable [list [namespace current]::recv_data $chan]
-
-  global [namespace current]::VERSION [namespace current]::_
-
-  send/recv $chan version [list $_($chan/iounit) $VERSION] {riounit rver}
-  if {$rver == $VERSION} {
-    set _($chan/iounit) [expr {min($_($chan/iounit), $riounit)}]
-  } else {
-    return -code error "Unsupported version: $rver."
-  }
-}
-
-proc stop {chan} {
-  cleanup_session $chan
+proc 9stop {chan} {
+  global 9ctx
+  array unset 9ctx $chan/*
   fileevent $chan readable {}
 }
 
-##
-## CHAN
-##
-
-proc handle_initialize {chan fid self mode} {
-  upvar $self fd
-  global [namespace current]::_
-
-  set hdr [expr {4 + 1 + 2 + 4}]
-  array set fd {off 0
-                inbuf ""
-                outbuf ""
-                block 1
-                watch_write 0
-                watch_read 0}
-  set fd(mode) $mode
-  set fd(iounit) [expr {$_($chan/iounit) - $hdr}]
-  return {initialize finalize watch read write seek configure cget cgetall
-          blocking}
+proc 9start {chan} {
+  global 9p 9ctx 9session_vars
+  fconfigure $chan -blocking 0
+  catch {fconfigure $chan -encoding binary}
+  foreach {k v} $9session_vars {
+    set 9ctx($chan/$k) $v
+  }
+  set msg(type) Tversion
+  set msg(msize) 65536
+  set msg(version) $9p(VERSION)
+  fileevent $chan readable [list 9recv_data $chan]
+  9send_msg msg $chan 1 {
+    global 9ctx 9p
+    if {[info exists msg(ename)]} {
+      return -code error "9p error: $msg(ename)"
+    }
+    if {$msg(version) ne $9p(VERSION)} {
+      9stop $chan
+      return -code error "Version $msg(version) is not supported."
+    }
+    if {$9ctx($chan/msize) > $msg(msize)} {
+      set 9ctx($chan/msize) $msg(msize)
+    }
+  }
+  return true
 }
 
-proc handle_configure {chan fid self option value} {
-  switch $option {
-    -blocking { handle_blocking $chan $fid $self $value }
+proc named {a def} {
+  upvar 1 _ _
+  array set _ $def
+  foreach {key value} $a {
+    if {![info exists _($key)]} {
+      error "bad option '$key', should be one of: [lsort [array names _]]"
+    }
+    set _($key) $value
   }
 }
 
-proc handle_cget {chan fid self option} {
-  upvar $self fd
-  switch $option {
-    -blocking { set ret $fd(block) }
+proc 9attach {chan args} {
+  global 9p
+  set user "noname"
+  catch {set user $tcl_platform(user)}
+  named $args [list -uname $user -aname "" -afid $9p(NOFID) -cmd {}]
+  set msg(type) Tattach
+  set msg(fid) [9new_id fid $chan]
+  set msg(afid) $_(-afid)
+  set msg(uname) $_(-uname)
+  set msg(aname) $_(-aname)
+  set sync 0
+  if {$_(-cmd) eq {}} {
+    set sync 1
+    set _(-cmd) "expr {$msg(fid)}"
   }
-  return $ret
+  return [9send_msg msg $chan $sync $_(-cmd)]
 }
 
-proc handle_cgetall {chan fid self} {
-  upvar $self fd
-  return [list -blocking $fd(block)]
+proc 9auth {chan args} {
+  set user "noname"
+  catch {set user $tcl_platform(user)}
+  named $args [list -uname $user -aname "" -afid $9p(NOFID) -sync 0 -cmd {}]
+  set msg(type) Tauth
+  set msg(afid) [9new_id fid $chan]
+  set msg(uname) $_(-uname)
+  set msg(aname) $_(-aname)
+  set cmd [expr {($_(-cmd) eq {}) ? "expr {$msg(fid)}" : $_(-cmd)}]
+  return [9send_msg msg $chan $_(-sync) $cmd]
 }
 
-proc read_file {chan fid self count} {
-  upvar $self fd
-  set count [expr {min($count, $fd(iounit))}]
-  send/recv $chan read [list $fid $fd(off) $count] {data}
-  append fd(inbuf) $data
-  set nread [string length $data]
-  incr fd(off) $nread
-  if {$fd(watch_read)} {
-    after 1 [list chan postevent $self read]
+proc 9flush_handler {chan tag cmd} {
+  global 9ctx
+  unset -nocomplain 9ctx($chan/var/$tag) 9ctx($chan/handler/$tag)
+  9rm_id tags $tag $chan
+  uplevel 1 $cmd
+}
+
+proc 9flush {chan tag {cmd ""}} {
+  set msg(type) Tflush
+  set msg(oldtag) $tag
+  set sync [expr {$cmd eq {}}]
+  return [9send_msg msg $chan $sync [9flush_handler $chan $tag $cmd]]
+}
+
+proc 9walk_handler {var n cmd} {
+  upvar 1 $var msg
+  if {[info exists msg(ename)]} {
+    return -code error "9p error: $msg(ename)"
   }
-  return $nread
+  if {$n > [llength $msg(wqid)]} {
+    return -code error "walk error"
+  }
+  uplevel 1 $cmd
 }
 
-proc sched_read_file {chan fid self} {
-  upvar $self fd
-  set count $fd(iounit)
-  after 1 [list [namespace current]::read_file $chan $fid $self $count]
-}
-
-proc handle_read {chan fid self count} {
-  upvar $self fd
-  set off $fd(off)
-  if {$fd(block)} {
-    set nread [read_file $chan $fid $self $count]
-    set buf $fd(inbuf)
-    set data [string range $buf 0 $nread]
-    set fd(inbuf) [string range $buf $nread end]
+proc 9walk_aux {chan fid newfid names sync cmd} {
+  global 9ctx
+  set size [expr {4 + 1 + 2 + 4 + 4 + 2}]
+  set i 0
+  foreach name $names {
+    set ds [expr {2 + [string length $name]}]
+    if {$size + $ds > $9ctx($chan/msize)} {
+      break
+    }
+    incr size $ds
+    incr i
+  }
+  set msg(type) Twalk
+  set msg(fid) $fid
+  set msg(newfid) $newfid
+  set msg(wname) [lrange $names 0 $i]
+  set names [lrange $names $i+1 end]
+  if {$cmd eq {}} {
+    set cmd {expr {$msg(newfid)}}
+  }
+  if {$names eq {}} {
+    set c $cmd
   } else {
-    set buf $fd(inbuf)
-    set n [expr {min($count, [string length $buf])}]
-    set data [string range $buf 0 $n]
-    set fd(inbuf) [string range $buf $n end]
-    sched_read_file $chan $fid $self
+    set c [list 9walk_aux $chan $fid $newfid $names $sync $cmd]
+  }
+  set n [llength $msg(wname)]
+  return [9send_msg msg $chan $sync [list 9walk_handler msg $n $c]]
+}
+
+proc 9cleanpath {path} {return [string trim [regsub -all {//*} $path {/}] /]}
+
+proc 9walk {chan fid path {cmd ""}} {
+  set names [split [9cleanpath $path] /]
+  set newfid [9new_id fid $chan]
+  set sync [expr {$cmd eq {}}]
+  return [9walk_aux $chan $fid $newfid $names $sync $cmd]
+}
+
+proc 9open {chan fid mode {cmd ""}} {
+  global 9open_modes
+  set msg(type) Topen
+  set msg(fid) $fid
+  if {[string is integer $mode]} {
+    set msg(mode) $mode
+  } else {
+    set msg(mode) $9open_modes($mode)
+  }
+  set sync [expr {$cmd eq {}}]
+  if {$cmd eq {}} {
+    set cmd {
+      if {[info exists msg(ename)]} {
+        return -code error "9p error: $msg(ename)"
+      }
+      expr {$msg(iounit)}
+    }
+  }
+  return [9send_msg msg $chan $sync $cmd]
+}
+
+proc 9create {chan fid name perm mode {cmd ""}} {
+  global 9open_modes
+  set msg(type) Tcreate
+  set msg(fid) $fid
+  set msg(name) $name
+  if {[string is integer $mode]} {
+    set msg(mode) $mode
+  } else {
+    set msg(mode) $9open_modes($mode)
+  }
+  set msg(perm) $perm
+  set sync [expr {$cmd eq {}}]
+  if {$cmd eq {}} {
+    set cmd {
+      if {[info exists msg(ename)]} {
+        return -code error "9p error: $msg(ename)"
+      }
+      expr {$msg(iounit)}
+    }
+  }
+  return [9send_msg msg $chan $sync $cmd]
+}
+
+proc 9read {chan fid offset count {cmd ""}} {
+  set msg(type) Tread
+  set msg(fid) $fid
+  set msg(offset) $offset
+  set msg(count) $count
+  set sync [expr {$cmd eq {}}]
+  if {$cmd eq {}} {
+    set cmd {
+      if {[info exists msg(ename)]} {
+        return -code error "9p error: $msg(ename)"
+      }
+      expr {"$msg(data)"}
+    }
+  }
+  return [9send_msg msg $chan $sync $cmd]
+}
+
+proc 9write {chan fid offset data {cmd ""}} {
+  set msg(type) Twrite
+  set msg(fid) $fid
+  set msg(offset) $offset
+  set msg(data) $data
+  set sync [expr {$cmd eq {}}]
+  if {$cmd eq {}} {
+    set cmd {
+      if {[info exists msg(ename)]} {
+        return -code error "9p error: $msg(ename)"
+      }
+      expr {"$msg(count)"}
+    }
+  }
+  return [9send_msg msg $chan $sync $cmd]
+}
+
+proc 9clunk {chan fid {cmd ""}} {
+  set msg(type) Tclunk
+  set msg(fid) $fid
+  set sync [expr {$cmd eq {}}]
+  return [9send_msg msg $chan $sync $cmd]
+}
+
+proc 9remove {chan fid {cmd ""}} {
+  set msg(type) Tremove
+  set msg(fid) $fid
+  set sync [expr {$cmd eq {}}]
+  return [9send_msg msg $chan $sync $cmd]
+}
+
+proc 9stat {chan fid {cmd ""}} {
+  set msg(type) Tstat
+  set msg(fid) $fid
+  set sync [expr {$cmd eq {}}]
+  if {$cmd eq {}} {
+    set cmd {
+      if {[info exists msg(ename)]} {
+        return -code error "9p error: $msg(ename)"
+      }
+      9dec_msg stat $msg(stat) stat
+      array get stat
+    }
+  }
+  return [9send_msg msg $chan $sync $cmd]
+}
+
+proc 9wstat {chan fid statvar {cmd ""}} {
+}
+
+proc 9session_open {chan args} {
+  9start $chan
+  set rootfid [9attach $chan {*}$args]
+  return [list session $chan $rootfid]
+}
+
+proc 9file_ctx {x type chanvar fidvar} {
+  upvar 1 $chanvar c
+  upvar 1 $fidvar f
+  foreach {id c f} $x break
+  if {$id ne $type} {
+    return -code error "Invalid $type."
+  }
+}
+
+proc 9session_close {session} {
+  global 9ctx
+  9file_ctx $session session chan rootfid
+  9clunk $chan $rootfid
+  9stop $chan
+}
+
+proc 9file_open {session name mode} {
+  global 9ctx
+  9file_ctx $session session chan rootfid
+  set name [9cleanpath $name]
+  if {[catch {set fid [9walk $chan $rootfid $name]}]} {
+    set fid [9walk $chan $rootfid [file dirname $name]]
+    set perm 0o644
+    set iounit {9create $chan $fid [file basename $name] $mode $perm}
+  } else {
+    set iounit [9open $chan $fid $mode]
+  }
+  set 9ctx($chan/file/$fid/iounit) $iounit
+  set 9ctx($chan/file/$fid/off) 0
+  set 9ctx($chan/file/$fid/inbuf) ""
+  set 9ctx($chan/file/$fid/readable_cmd) {}
+  return [list file $chan $fid]
+}
+
+proc 9file_close {file} {
+  global 9ctx
+  9file_ctx $file file chan fid
+  array unset 9ctx $chan/file/$fid/*
+  9clunk $chan $fid
+}
+
+proc 9file_read_async {file {size ""}} {
+  global 9ctx
+  9file_ctx $file file chan fid
+  if {![info exists 9ctx($chan/file/$fid/inbuf)]} {
+    return {}
+  }
+  set buf $9ctx($chan/file/$fid/inbuf)
+  set len [string length $buf]
+  if {$size eq "" || $len < $size} {
+    return $buf
+  }
+  set 9ctx($chan/file/$fid/inbuf) [string range $buf $size end]
+  return [string range $buf 0 $size-1]
+}
+
+proc 9file_read {file {size ""}} {
+  global 9ctx
+  9file_ctx $file file chan fid
+  if {[info exists 9ctx($chan/file/$fid/inside_readable)]} {
+    return [9file_read_async $file $size]
+  }
+  set off $9ctx($chan/file/$fid/off)
+  set dsize $size
+  if {$size eq "" || $size + 23 > $9ctx($chan/file/$fid/iounit)} {
+    set dsize [expr {$9ctx($chan/file/$fid/iounit) - 23}]
+  }
+  set data $9ctx($chan/file/$fid/inbuf)
+  set read_bytes [string length $data]
+  while {$dsize > 0} {
+    set d [9read $chan $fid $off $dsize]
+    set n [string length $d]
+    incr read_bytes $n
+    incr off $n
+    set 9ctx($chan/file/$fid/off) $off
+    append data $d
+    if {$d eq ""} {
+      break
+    }
+    if {$size ne "" && $read_bytes + $dsize > $size} {
+      set dsize [expr {$size - $read_bytes}]
+    }
   }
   return $data
 }
 
-proc write_file {chan fid self off data} {
-  upvar $self fd
-  append fd(outbuf) $data
-  set off $fd(off)
-  set written 0
-  while {1} {
-    set len [string length $fd(outbuf)]
-    if {$len <= 0} {
-      break
-    }
-    set n [expr {min($fd(iounit), $len)}]
-    set buf $fd(outbuf)
-    send/recv $chan write [list $fid $off [string range $buf 0 $n]] {count}
-    set fd(outbuf) [string range $buf $count end]
-    incr fd(off) $count
-    incr written $count
+proc 9file_read_handler {file id off size var cmd} {
+  global 9ctx
+  upvar 1 $var msg
+  if {[info exists msg(ename)]} {
+    return -code error "9p error: $msg(ename)"
   }
-  if {$fd(watch_write)} {
-    after 1 [list chan postevent $self write]
-  }
-  return [expr {min($written, [string length $data])}]
+  9file_ctx $file file chan fid
+  incr 9ctx($chan/file/$fid/off) [string length $m(data)]
+  append 9ctx($chan/file/$fid/inbuf) $m(data)
+  set 9ctx($chan/file/$fid/inside_readable) 1
+  uplevel #0 $cmd
+  unset -nocomplain 9ctx($chan/file/$fid/inside_readable)
+  9file_readable $file $cmd
 }
 
-proc handle_write {chan fid self data} {
-  upvar $self fd
-  set off fd(off)
-  if {$fd(block)} {
-    set count [write_file $chan $fid $self $off $data]
+proc 9file_readable {file args} {
+  global 9ctx
+  9file_ctx $file file chan fid
+  if {$args eq ""} {
+    catch {return $9ctx($chan/file/$fid/readable_cmd)}
+    return
+  }
+  set cmd [lindex $args 0]
+  set 9ctx($chan/file/$fid/readable_cmd) $cmd
+  if {[info exists 9ctx($chan/file/$fid/inside_readable)]} {
+    return
+  }
+  if {$cmd ne ""} {
+    set off $9ctx($chan/file/$fid/off)
+    set size [expr $9ctx($chan/file/$fid/iounit)]
+    set c [list 9file_read_handler $file $off $size msg $cmd]
+    set tag [9read $chan $fid $off $c]
   } else {
-    after 1 [list write_file $chan $fid $self $off $fd(outbuf)]
-    set count 0
+    vwait 9ctx($chan/file/$fid/inbuf)
   }
-  return $count
+  return
 }
 
-proc handle_watch {chan fid self event} {
-  upvar $self fd
-  set fd(watch_read) 0
-  set fd(watch_write) 0
-  if {[lsearch $event read] >= 0} {
-    set fd(watch_read) 1
-    if {!fd(block)} {
-      sched_read_file $chan $fid $self
+proc 9file_write {file data} {
+  global 9ctx
+  9file_ctx $file file chan fid
+  set off $9ctx($chan/file/$fid/off)
+  set size [string length $data]
+  set dsize $size
+  if {$dsize > $9ctx($chan/file/$fid/iounit)} {
+    set dsize [expr $9ctx($chan/file/$fid/iounit)]
+  }
+  set i 0
+  while {$dsize > 0} {
+    set end [expr {$i + $dsize - 1}]
+    set n [9write $chan $fid $off [string range $data $i $end]]
+    incr i $n
+    incr off $n
+    set 9ctx($chan/file/$fid/off) $off
+    if {$i + $dsize > $size} {
+      set dsize [expr {$size - $i}]
     }
   }
-  if {[lsearch $event write] >= 0} {
-    set fd(watch_write) 1
-    chan postevent $self write
-  }
+  return $i
 }
 
-proc handle_seek {chan fid self off base} {
-  upvar $self fd
-  switch $base {
-    start { set fd(off) $off }
-    current { incr fd(off) $off }
+proc 9file_seek {file offset {origin "start"}} {
+  global 9ctx
+  9file_ctx $file file chan fid
+  set off $9ctx($chan/file/$fid/off)
+  switch -- $origin {
+    start {set 9ctx($chan/file/$fid/off) $offset}
+    current {incr 9ctx($chan/file/$fid/off) $offset}
     end {
-      send/recv $chan stat [list $fid] {total fsize ftype fdev fqid_type
-                                        fqid_ver fqid_path fmode fatime
-                                        fmtime flen fname fuid fgid fmuid}
-      set fd(off) $flen
+      9file_stat $file stat
+      set off [expr {$stat(length) - $offset}]
+      set 9ctx($chan/file/$fid/off) [expr {$off >= 0 ? $off : 0}]
     }
   }
-  return $fd(off)
+  return
 }
 
-proc handle_blocking {chan fid self mode} {
-  upvar $self fd
-  set fd(block) $mode
+proc 9file_tell {file} {
+  global 9ctx
+  9file_ctx $file file chan fid
+  return $9ctx($chan/file/$fid/off)
 }
 
-proc chan_handle {chan fid command self args} {
-  set fd [namespace current]::file/$self
-  global $fd
-  switch $command {
-    finalize {
-      unset $fd
-      send/recv $chan clunk $fid
-      rm_id fid $fid $chan
-    }
-    default { eval [list handle_$command $chan $fid $fd] $args }
+proc 9file_stat {file var} {
+  upvar 1 $var stat
+  9file_ctx $file file chan fid
+  array set stat [9stat $chan $fid]
+}
+
+proc 9file_ls {session path args} {
+  set fd [9file_open $session $path r]
+  set data [9file_read $fd]
+  set i 0
+  set size [string length $data]
+  set ret {}
+  while {$i < $size} {
+    binary scan [string range $data $i $i+3] su1 s
+    9dec_msg stat [string range $data $i [expr {$i + $s - 1}]] stat
+    set d [string range $data $i [expr {$i + $s - 1}]]
+    incr i $s
+    incr i 2
+    lappend ret $stat(name)
   }
-}
-
-proc chan_from_fid {chan fid mode} {
-  global [namespace current]::chan_open_modes
-  chan create $chan_open_modes($mode) \
-              [list [namespace current]::chan_handle $chan $fid]
-}
-
-##
-## COMMANDS
-##
-
-proc auth {chan user name code} {
-  set afid [new_id fid $chan]
-  send/recv $chan auth [list $afid $user $name] {qid_type qid_ver qid_path}
-  set table [list %f $afid %t $qid_type %v $qid_ver %p $qid_path]]
-  set cmd [string map $code $table]
-  eval $cmd
-}
-
-proc named {args defaults} {
-  upvar 1 "" ""
-  array set "" $defaults
-  foreach {key value} $args {
-    if {![info exists ($key)]} {
-      error "bad option '$key', should be one of: [lsort [array names {}]]"
-    }
-    set ($key) $value
-  }
-}
-
-proc attach {chan args} {
-  global [namespace current]::NOFID tcl_platform
-
-  named $args [list -user $tcl_platform(user) \
-                    -name "" \
-                    -afid $NOFID \
-                    -command {}]
-
-  set fid [new_id fid $chan]
-  send/recv $chan attach [list $fid $(-afid) $(-user) $(-name)] \
-                         {qid_type qid_ver qid_path}
-  if {$(-command) != ""} {
-    set mapping [list %f $fid %t $qid_type %v $qid_ver %p $qid_path]]
-    set cmd [string map $mapping $(-command)]
-    eval $cmd
-  }
-
-  return $fid
-}
-
-proc walk {chan from_fid fid path} {
-  global [namespace current]::_
-  set iounit $_($chan/iounit)
-  set hdrsize [expr {4 + 1 + 2 + 4 + 4 + 2}]
-  set size 0
-  set num 0
-  set buf ""
-  #DBG "(walk) path: '$path'"
-  if {$path eq ""} {
-    #DBG "(walk) walking to root"
-    send/recv $chan walk [list $from_fid $fid 0 ""] {qids}
-  } else {
-    foreach f [file split $path] {
-      #DBG "(walk) walking to: $f"
-      set str [encoding convertto utf-8 $f]
-      set len [string length $str]
-      if {[expr {$size + 2 + $len + $hdrsize < $iounit}]} {
-        append buf [binary format sa$len $len $str]
-        incr size [expr {2 + $len}]
-        incr num
-      } else {
-        send/recv $chan walk [list $from_fid $fid $num $buf] {qids}
-        set fid $newfid
-        set size 0
-        set num 0
-        set buf ""
-      }
-    }
-    if {$size > 0} {
-      send/recv $chan walk [list $from_fid $fid $num $buf] {qids}
-    }
-  }
-}
-
-proc walk_fid {chan from_fid path} {
-  set fid [new_id fid $chan]
-  if {[catch [list walk $chan $from_fid $fid $path]]} {
-    rm_id fid $fid $chan
-    return -1
-  } else {
-    return $fid
-  }
-}
-
-proc create_file {chan root_fid name mode perm} {
-  global [namespace current]::QDIR
-  set fid [walk_fid $chan $root_fid [file dirname $name]]
-  if {$fid >= 0} {
-    send/recv $chan stat [list $fid] {total fsize ftype fdev fqid_type
-                                      fqid_ver fqid_path fmode fatime
-                                      fmtime flen fname fuid fgid fmuid}
-    if {[expr {$fqid_type & $QDIR}]} {
-      send/recv $chan create [list $fid [file tail $name] $perm $mode] \
-                             {qid iounit}
-      set ret $fid
-    } else {
-      rm_id fid $fid $chan
-      return -code error "couldn't create \"$name\""
-    }
-  } else {
-    return -code error "couldn't create \"$name\""
-  }
-  return $fid
-}
-
-proc open_file {chan root_fid name {mode r} {perm 0644}} {
-  global [namespace current]::open_modes
-  set ret ""
-  set binary ""
-  if {$mode eq ""} {
-    set mode r
-  }
-  if {[string match *b $mode]} {
-    set binary b
-    set mode [string range $mode 0 end-1]
-  }
-  set fid [walk_fid $chan $root_fid $name]
-  if {$fid < 0} {
-    if {[string match {[aw]*} $mode]} {
-      set fid [create_file $chan $root_fid $name $open_modes($mode) $perm]
-      set ret [chan_from_fid $chan $fid "$mode$binary"]
-    } else {
-      return -code error "couldn't open \"$name\": no such file or directory"
-    }
-  } else {
-    send/recv $chan stat [list $fid] {total fsize ftype fdev fqid_type
-                                      fqid_ver fqid_path fmode fatime
-                                      fmtime flen fname fuid fgid fmuid}
-    send/recv $chan open [list $fid $open_modes($mode)] {qid iounit}
-    set ret [chan_from_fid $chan $fid "$mode$binary"]
-  }
+  9file_close $fd
   return $ret
 }
 
-proc read_dir {chan root_fid name {command ""}} {
-  set f [open_file $chan $root_fid $name]
-  fconfigure $f -translation binary -encoding binary
-  set ret [list]
-  while {1} {
-    set data [read $f]
-    if {$data eq ""} {
+proc 9file_mkdir {session path} {
+  global 9p
+  9file_ctx $session session chan rootfid
+  set fid $rootfid
+  set i 0
+  set path [split [9cleanpath $path] /]
+  foreach name $path {
+    if {[catch {set fid [9walk $chan $fid $name]}]} {
       break
     }
-    while {[string length $data]} {
-      decstat $data {fsize ftype fdev fqid_type fqid_ver fqid_path fmode
-                     fatime fmtime flen fname fuid fgid fmuid}
-      #DBG "read_dir flen: $flen name: $fname uid: $fuid"
-      set data [string range $data [expr {$fsize + 2}] end]
-      if {$command eq ""} {
-        lappend ret $fname
-      } else {
-        set map [list %n "{$fname}" %t $fqid_type %m $fmode]
-        lappend ret [eval [string map $map $command]]
-      }
-    }
+    incr i
   }
-  return $ret
+  foreach name [lrange $path $i end] {
+    set perm [expr {0o755 | $9p(DMDIR)}]
+    set iounit [9create $chan $fid $name $perm 0]
+  }
+  9clunk $chan $fid
 }
 
-#
-# VFS
-#
+if {[info command chan] ne ""} {
+  proc 9chan_initialize {chan fid self mode} {
+    global 9ctx
+    set key
+    set 9ctx($chan/chan/$fid/$self/block) 1
+    set 9ctx($chan/chan/$fid/$self/watch_write) 0
+    set 9ctx($chan/chan/$fid/$self/watch_read) 0
+    set 9ctx($chan/chan/$fid/$self/mode) $mode
+    return {initialize finalize watch read write seek configure cget cgetall
+            blocking}
+  }
 
-proc vfs_access {chan root_fid root name mode} {
-  set fid [walk_fid $chan $root_fid $name]
-  set ret 0
-  if {$fid >= 0} {
-    send/recv $chan stat [list $fid] {total fsize ftype fdev fqid_type
-                                      fqid_ver fqid_path fmode fatime
-                                      fmtime flen fname fuid fgid fmuid}
-    rm_id fid $fid $chan
-    #DBG "(vfs/access) file.mode: $fmode mode: $mode"
-    set ret [expr {($fmode & $mode) == $mode}]
+  proc 9chan_configure {chan fid self option value} {
+    global 9ctx
+    switch -- $option {
+      -blocking {set 9ctx($chan/chan/$fid/$self/block) $value}
+    }
+  }
+
+  proc 9chan_cget {chan fid self option} {
+    global 9ctx
+    switch -- $option {
+      -blocking {return $9ctx($chan/chan/$fid/$self/block)}
+    }
+  }
+
+  proc 9chan_cgetall {chan fid self} {
+    return [list -blocking $9ctx($chan/chan/$fid/$self/block)]
+  }
+
+  proc 9chan_handle {file cmd self args} {
+    9file_ctx $file file chan fid
+    uplevel 1 [list 9chan_$cmd $chan $fid $self] $args
+  }
+
+  proc 9chan {file mode} {
+    global 9chan_open_modes
+    chan create $9chan_open_modes($mode) [list 9chan_handle $file]
+  }
+}
+
+proc hexdump {s} {
+  binary scan $s H* hex
+  return $hex
+}
+
+proc test {} {
+  global 9msg_fmt
+  array set msg {
+    tag 1
+    type 100
+    msize 1023
+    version 9P2000
+  }
+  set buf [9enc_msg msg]
+  puts "buf([string length $buf]): [hexdump $buf]"
+  puts "buf*: [hexdump [string range $buf 4 end]]"
+  9dec_msg [9msg_number Tversion] [string range $buf 7 end] rmsg
+  parray rmsg
+}
+
+proc test_fid {} {
+  global 9ctx 9session_vars
+  set chan x
+  unset -nocomplain 9ctx
+  foreach {k v} $9session_vars {
+    set 9ctx($chan/$k) $v
+  }
+  for {set i 0} {$i < 10} {incr i} {
+    set fid [9new_id fid $chan]
+    puts "fid: $fid"
+  }
+}
+
+proc test_simple {} {
+  global 9ctx
+  unset -nocomplain 9ctx
+  if {[catch {info tclversion}]} {
+    set fd [socket stream 127.0.0.1:5558]
   } else {
-    error "No such file"
+    set fd [socket 127.0.0.1 5558]
   }
-  #DBG "(vfs/access) ret: $ret"
-  return $ret
-}
-
-proc vfs_createdirectory {chan root_fid root name} {
-  global [current namespace]::QDIR
-  set fid [create_file chan $root_fid $name 0 [expr {0777 | $QDIR}]]
-  rm_id fid $fid $chan
-}
-
-proc vfs_deletefile {chan root_fid root name} {
-  set fid [walk_fid $chan $root_fid $name]
-  if {$fid >= 0} {
-    send/recv $chan [list $fid] {}
-    rm_id fid $fid $chan
+  9start $fd
+  set fid [9attach $fd]
+  puts_log dbg "attach fid: $fid"
+  set ret [9walk $fd $fid "fonts/list"]
+  puts_log dbg "walk ret: $ret"
+  if {![9open $fd $ret r]} {
+    puts_log dbg "open failed"
   }
+  set data [9read $fd $ret 0 65536]
+  puts_log dbg "contents:\n---\n$data\n---"
+  9clunk $fd $ret
+  9stop $fd
+  close $fd
 }
 
-proc vfs_fileattributes {chan root_fid root name {index {}} {value {}}} {
-  return {}
-}
-
-proc vfs_matchindirectory {chan root_fid root name pattern types} {
-  set show_dirs [vfs::matchDirectories $types]
-  set show_files [vfs::matchFiles $types]
-  global [namespace current]::DMDIR
-  set ret [list]
-  #DBG "(match) dirs: $show_dirs files: $show_files"
-  if {$pattern eq ""} {
-    set stat [vfs_stat $chan $root_fid $name]
-    set type
-    switch [dict get $stat type] {
-      file {
-        if {$show_files} {
-          lappend ret $root
-        }
-      }
-      directory {
-        if {$show_dirs} {
-          lappend ret $root
-        }
-      }
-    }
-    lappend ret
+proc test_fileio {} {
+  global 9ctx
+  unset -nocomplain 9ctx
+  if {[catch {info tclversion}]} {
+    set fd [socket stream 127.0.0.1:5558]
   } else {
-    foreach ent [read_dir $chan $root_fid $name {list %n %m}] {
-      lassign $ent file type
-      if {[string match $pattern $file]} {
-        if {[expr {$type & $DMDIR}]} {
-          if {$show_dirs} {
-            lappend ret [file join $root $file]
-          }
-        } elseif {$show_files} {
-          lappend ret [file join $root $file]
-        }
-      }
-    }
+    set fd [socket 127.0.0.1 5558]
   }
-  return $ret
+  set s [9session_open $fd]
+  puts_log dbg "session: $s"
+  set f [9file_open $s "fonts/list" r]
+  puts_log dbg "f: $f"
+  set data [9file_read $f]
+  puts_log dbg "contents:\n---\n$data\n---"
+  9file_close $f
+  9session_close $s
+  close $fd
 }
-
-proc vfs_open {chan root_fid root name mode perm} {
-  return [open_file $chan $root_fid $name $mode $perm]
-}
-
-proc vfs_removedirectory {chan root_fid root name recursive} {
-  if {$recursive} {
-    vfs_delete_file $chan $root_fid $name
-  } else {
-    if {[read_dir $chan $root_fid $name {list %n %m}] eq ""} {
-      vfs_delete_file $chan $root_fid $name
-    } else {
-      return -code error EEXIST
-    }
-  }
-}
-
-proc vfs_stat {chan root_fid root name} {
-  global [namespace current]::DMDIR
-  set fid [walk_fid $chan $root_fid $name]
-  set ret [list]
-  if {$fid >= 0} {
-    send/recv $chan stat [list $fid] {total fsize ftype fdev fqid_type
-                                      fqid_ver fqid_path fmode fatime
-                                      fmtime flen fname fuid fgid fmuid}
-    rm_id fid $fid $chan
-    if {[expr {$fmode & $DMDIR}]} {
-      set type directory
-    } else {
-      set type file
-    }
-    set ret [list dev -1 \
-                  mode [expr {$fmode & 0777}] \
-                  nlink 1 \
-                  uid -1 \
-                  gid -1 \
-                  atime $fatime \
-                  mtime $fmtime \
-                  ctime $fmtime \
-                  type $type]
-    #DBG "(vfs/stat) name: $fname stat: $ret"
-  }
-  return $ret
-}
-
-proc vfs_utime {chan root_fid root name actime mtime} {
-  set fid [walk_fid $chan $root_fid $name]
-  if {$fid >= 0} {
-    set n1 [expr {2 + 2 + 4 + 1 + 4 + 8 + 4}]
-    set total [expr {$n1 + 8 + 2 + 2 + 2 + 2}]
-    set buf [binary format $stat c${nsize}iu1iu1iu1iu1su1su1su1su1
-                                 [lrepeat $n1 0xff]
-                                 $actime $mtime
-                                 0xffffffff 0xffffffff
-                                 0 0 0 0]
-    send/recv $chan wstat [list $fid $buf]
-    rm_id fid $fid $chan
-  }
-}
-
-proc vfs_cmd {chan root_fid cmd root rel path args} {
-  #DBG "(vfs/cmd) cmd: $cmd"
-  #DBG "          root: '$root'"
-  #DBG "          rel: '$rel'"
-  #DBG "          path: '$path'"
-  #DBG "          args: '$args'"
-  eval [list vfs_$cmd $chan $root_fid $path $rel] $args
-}
-
-proc file_stat {mnt name} {
-  set mount [namespace current]::mount/$mnt
-  upvar #0 $mount m
-  set ret {}
-  if {[info exists m(chan)] && [info exists m(root_fid)] && $m(chan) ne ""} {
-    set chan $m(chan)
-    set root_fid $m(root_fid)
-    set fid [walk_fid $chan $root_fid $name]
-    if {$fid >= 0} {
-      send/recv $chan stat [list $fid] {total fsize ftype fdev fqid_type
-                                        fqid_ver fqid_path fmode fatime
-                                        fmtime flen fname fuid fgid fmuid}
-      rm_id fid $fid $chan
-      set ret [list -dev $fdev \
-                    -mode [expr {$fmode & 0777}] \
-                    -nlink 1 \
-                    -uid $fuid \
-                    -gid $fgid \
-                    -atime $fatime \
-                    -mtime $fmtime \
-                    -ctime $fmtime \
-                    -fmuid $fmuid]
-    }
-  }
-  return $ret
-}
-
-proc mount {chan path args} {
-  global [namespace current]::mount [namespace current]::_
-  if {[info exists mount($path/refcount)]} {
-    incr mount($path/refcount)
-  } else {
-    set mount($path/refcount) 1
-    set mount($path/chan) $chan
-  }
-  if {![info exists _(tag/$chan)]} {
-    9p::start $chan
-  }
-  set fid [eval [list attach $chan] $args]
-  if {$fid >= 0} {
-    set mount($path/root_fid) $fid
-    ::vfs::filesystem mount -volume $path \
-                      [list [namespace current]::vfs_cmd $chan $fid]
-  }
-}
-
-proc umount {path} {
-  global [namespace current]::mount
-  if {[info exists mount($path/refcount)]} {
-    if {$mount($path/refcount) > 0} {
-      incr mount($path/refcount) -1
-      if {$mount($path/refcount) eq 0} {
-        stop $mount($path/chan)
-        array unset mount $path/*
-      }
-    }
-  }
-}
-}
-
-package provide 9p 0.1
-
