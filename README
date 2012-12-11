@@ -1,0 +1,7 @@
+9ptcl
+=====
+9P2000 protocol implementation for 9p.
+
+Features (already implemented or almost implemented):
+  - support for asynchronous operations,
+  - works in jimtcl.
