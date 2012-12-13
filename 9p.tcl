@@ -32,7 +32,7 @@ array set 9msg_fmt {
   Rremove {}
   Tstat {u4 fid}
   Rstat {d2 stat}
-  Twstat {u4 fid stat stat}
+  Twstat {u4 fid d2 stat}
   Rwstat {}
 }
 
@@ -111,13 +111,35 @@ proc puts_log {tag msg} {
   }
 }
 
+if {[info command encoding] eq ""} {
+  proc 9bin_from_utf8 {str} {return $str}
+
+  proc 9bin_len {str} {
+    binary scan $str H* x
+    return [expr {[string length $x] >> 1}]
+  }
+
+  proc 9bin_range {str start {end "end"}} {
+    set len [9bin_len $str]
+    if {$end eq "end" || $end >= $len} {
+      set end [expr {$len - 1}]
+    }
+    binary scan $str "x${start}a[expr {$end - $start + 1}]" ret
+    return $ret
+  }
+} else {
+  interp alias {} 9bin_from_utf8 {} encoding convertto utf-8
+  interp alias {} 9bin_len {} string length
+  interp alias {} 9bin_range {} string range
+}
+
 proc 9bin_read {stream fmt len var} {
   upvar 1 $var x
   upvar 1 $stream s
   set end [expr {$s(off) + $len}]
   switch -- $fmt {
-    * {set x [string range $s(buf) $s(off) $end-1]}
-    default {binary scan [string range $s(buf) $s(off) $end-1] $fmt x}
+    * {set x [9bin_range $s(buf) $s(off) [expr {$end - 1}]]}
+    default {binary scan [9bin_range $s(buf) $s(off) [expr {$end - 1}]] $fmt x}
   }
   set s(off) $end
 }
@@ -138,6 +160,7 @@ proc 9read_field {stream type var} {
     }
     d2 - s {
       9bin_read s su1 2 len
+      set ret {}
       9bin_read s * $len ret
       if {$type eq "s"} {
         catch {set ret [encoding convertfrom utf-8 $ret]}
@@ -145,6 +168,7 @@ proc 9read_field {stream type var} {
     }
     d4 {
       9bin_read s iu1 4 len
+      set ret {}
       9bin_read s * $len ret
     }
     qid* {
@@ -190,10 +214,9 @@ proc 9enc_field {type value} {
       append buf [9enc_field u8 [lindex $value 2]]
     }
     s {
-      append buf [binary format su1 [string length $value]]
-      set s $value
-      catch {set s [encoding convertto utf-8 $s]}
-      append buf $s
+      set str [9bin_from_utf8 $value]
+      append buf [binary format su1 [9bin_len $str]]
+      append buf $str
     }
     qid* {
       append buf [9enc_field u2 [llength $value]]
@@ -208,11 +231,11 @@ proc 9enc_field {type value} {
       }
     }
     d2 {
-      append buf [binary format su1 [string length $value]]
+      append buf [binary format su1 [9bin_len $value]]
       append buf $value
     }
     d4 {
-      append buf [binary format iu1 [string length $value]]
+      append buf [binary format iu1 [9bin_len $value]]
       append buf $value
     }
     default {error "Type $type is unsupported"}
@@ -227,7 +250,7 @@ proc 9enc_msg {var} {
   foreach {t key} $9msg_fmt($msg(type)) {
     append buf [9enc_field $t $msg($key)]
   }
-  set size [expr {[string length $buf] + 7}]
+  set size [expr {[9bin_len $buf] + 7}]
   return [binary format iu1cu1su1 $size $msg(type) $msg(tag)]$buf
 }
 
@@ -273,12 +296,12 @@ proc 9process_packet {chan} {
   global 9ctx
   set buf $9ctx($chan/buf)
   binary scan $buf iu1 msize
-  if {$msize > [string length $buf] || $msize < 7} {
+  if {$msize > [9bin_len $buf] || $msize < 7} {
     # error
     return
   }
-  set msg [string range $buf 0 $msize]
-  set 9ctx($chan/buf) [string range $buf $msize end]
+  set msg [9bin_range $buf 0 $msize]
+  set 9ctx($chan/buf) [9bin_range $buf $msize end]
   binary scan $msg iu1csu1 _ _ tag
   9rm_id tag $tag $chan
   if {[info exists 9ctx($chan/handler/$tag)]} {
@@ -299,10 +322,10 @@ proc 9recv_msg {chan} {
     if {$buf eq ""} {
       return 0
     }
-    puts_log data "buf([string length $buf]): [hexdump $buf]"
+    puts_log data "<<<<([9bin_len $buf]): [hexdump $buf]"
     set buf [append 9ctx($chan/buf) $buf]
     binary scan $buf iu1 msgsize
-    if {$msgsize <= [string length $buf]} {
+    if {$msgsize <= [9bin_len $buf]} {
       set 9ctx($chan/buf) $buf
       return 1
     }
@@ -311,7 +334,15 @@ proc 9recv_msg {chan} {
 
 proc 9recv_data {chan} {
   switch -- [9recv_msg $chan] {
-    -1 {return false}
+    -1 {
+      global 9ctx
+      foreach {k v} [array get 9ctx $chan/var/*] {
+        set 9ctx($k) [list type [9msg_number Rerror] \
+                           ename "Connection closed."]
+      }
+      fileevent $chan readable {}
+      return false
+    }
     0 {return true}
     1 {9process_packet $chan}
   }
@@ -328,7 +359,7 @@ proc 9process_msg {msgvar chan exptype buf} {
   if {$exptype + 1 != $type && $type != [9msg_number Rerror]} {
     return -code error "Unexpected message type $type for $exptype"
   }
-  9dec_msg $type [string range $buf 7 end] msg
+  9dec_msg $type [9bin_range $buf 7 end] msg
   set msg(chan) $chan
   set msg(type) $type
   set msg(tag) $tag
@@ -359,6 +390,9 @@ proc 9send_msg {msgvar chan sync code} {
   }
   set key $chan/handler/$m(tag)
   set 9ctx($key) [list 9recv_async $msgvar $chan $m(type) $code1]
+  puts_log dbg \
+           ">>>>([9bin_len $buf]): [string range [hexdump $buf] 0 32]"
+  puts_log data ">>>>([9bin_len $buf]): [hexdump $buf]"
   puts -nonewline $chan $buf
   flush $chan
   if {!$sync} {
@@ -379,8 +413,8 @@ proc 9stop {chan} {
 
 proc 9start {chan} {
   global 9p 9ctx 9session_vars
-  fconfigure $chan -blocking 0
-  catch {fconfigure $chan -encoding binary}
+  fconfigure $chan -blocking 0 -translation binary
+  catch {fconfigure $chan -translation binary -encoding binary}
   foreach {k v} $9session_vars {
     set 9ctx($chan/$k) $v
   }
@@ -404,7 +438,7 @@ proc 9start {chan} {
   return true
 }
 
-proc named {a def} {
+proc 9named {a def} {
   upvar 1 _ _
   array set _ $def
   foreach {key value} $a {
@@ -419,7 +453,7 @@ proc 9attach {chan args} {
   global 9p
   set user "noname"
   catch {set user $tcl_platform(user)}
-  named $args [list -uname $user -aname "" -afid $9p(NOFID) -cmd {}]
+  9named $args [list -uname $user -aname "" -afid $9p(NOFID) -cmd {}]
   set msg(type) Tattach
   set msg(fid) [9new_id fid $chan]
   set msg(afid) $_(-afid)
@@ -436,7 +470,7 @@ proc 9attach {chan args} {
 proc 9auth {chan args} {
   set user "noname"
   catch {set user $tcl_platform(user)}
-  named $args [list -uname $user -aname "" -afid $9p(NOFID) -sync 0 -cmd {}]
+  9named $args [list -uname $user -aname "" -afid $9p(NOFID) -sync 0 -cmd {}]
   set msg(type) Tauth
   set msg(afid) [9new_id fid $chan]
   set msg(uname) $_(-uname)
@@ -475,7 +509,7 @@ proc 9walk_aux {chan fid newfid names sync cmd} {
   set size [expr {4 + 1 + 2 + 4 + 4 + 2}]
   set i 0
   foreach name $names {
-    set ds [expr {2 + [string length $name]}]
+    set ds [expr {2 + [9bin_len [9bin_from_utf8 $name]]}]
     if {$size + $ds > $9ctx($chan/msize)} {
       break
     }
@@ -574,12 +608,15 @@ proc 9write {chan fid offset data {cmd ""}} {
   set msg(fid) $fid
   set msg(offset) $offset
   set msg(data) $data
+  puts_log dbg "write off: $msg(offset) count: [9bin_len $msg(data)]"
   set sync [expr {$cmd eq {}}]
   if {$cmd eq {}} {
     set cmd {
       if {[info exists msg(ename)]} {
+        puts_log dbg "9p error: $msg(ename)"
         return -code error "9p error: $msg(ename)"
       }
+      unset msg(data)
       expr {"$msg(count)"}
     }
   }
@@ -673,12 +710,12 @@ proc 9file_read_async {file {size ""}} {
     return {}
   }
   set buf $9ctx($chan/file/$fid/inbuf)
-  set len [string length $buf]
+  set len [9bin_len $buf]
   if {$size eq "" || $len < $size} {
     return $buf
   }
-  set 9ctx($chan/file/$fid/inbuf) [string range $buf $size end]
-  return [string range $buf 0 $size-1]
+  set 9ctx($chan/file/$fid/inbuf) [9bin_range $buf $size end]
+  return [9bin_range $buf 0 $size-1]
 }
 
 proc 9file_read {file {size ""}} {
@@ -693,10 +730,10 @@ proc 9file_read {file {size ""}} {
     set dsize [expr {$9ctx($chan/file/$fid/iounit) - 23}]
   }
   set data $9ctx($chan/file/$fid/inbuf)
-  set read_bytes [string length $data]
+  set read_bytes [9bin_len $data]
   while {$dsize > 0} {
     set d [9read $chan $fid $off $dsize]
-    set n [string length $d]
+    set n [9bin_len $d]
     incr read_bytes $n
     incr off $n
     set 9ctx($chan/file/$fid/off) $off
@@ -718,7 +755,7 @@ proc 9file_read_handler {file id off size var cmd} {
     return -code error "9p error: $msg(ename)"
   }
   9file_ctx $file file chan fid
-  incr 9ctx($chan/file/$fid/off) [string length $m(data)]
+  incr 9ctx($chan/file/$fid/off) [9bin_len $m(data)]
   append 9ctx($chan/file/$fid/inbuf) $m(data)
   set 9ctx($chan/file/$fid/inside_readable) 1
   uplevel #0 $cmd
@@ -753,7 +790,7 @@ proc 9file_write {file data} {
   global 9ctx
   9file_ctx $file file chan fid
   set off $9ctx($chan/file/$fid/off)
-  set size [string length $data]
+  set size [9bin_len $data]
   set dsize $size
   if {$dsize > $9ctx($chan/file/$fid/iounit)} {
     set dsize [expr $9ctx($chan/file/$fid/iounit)]
@@ -761,7 +798,7 @@ proc 9file_write {file data} {
   set i 0
   while {$dsize > 0} {
     set end [expr {$i + $dsize - 1}]
-    set n [9write $chan $fid $off [string range $data $i $end]]
+    set n [9write $chan $fid $off [9bin_range $data $i $end]]
     incr i $n
     incr off $n
     set 9ctx($chan/file/$fid/off) $off
@@ -804,12 +841,12 @@ proc 9file_ls {session path args} {
   set fd [9file_open $session $path r]
   set data [9file_read $fd]
   set i 0
-  set size [string length $data]
+  set size [9bin_len $data]
   set ret {}
   while {$i < $size} {
-    binary scan [string range $data $i $i+3] su1 s
-    9dec_msg stat [string range $data $i [expr {$i + $s - 1}]] stat
-    set d [string range $data $i [expr {$i + $s - 1}]]
+    binary scan [9bin_range $data $i [expr {$i + 3}]] su1 s
+    9dec_msg stat [9bin_range $data $i [expr {$i + $s - 1}]] stat
+    set d [9bin_range $data $i [expr {$i + $s - 1}]]
     incr i $s
     incr i 2
     lappend ret $stat(name)
@@ -892,9 +929,9 @@ proc test {} {
     version 9P2000
   }
   set buf [9enc_msg msg]
-  puts "buf([string length $buf]): [hexdump $buf]"
-  puts "buf*: [hexdump [string range $buf 4 end]]"
-  9dec_msg [9msg_number Tversion] [string range $buf 7 end] rmsg
+  puts "buf([9bin_len $buf]): [hexdump $buf]"
+  puts "buf*: [hexdump [9bin_range $buf 4 end]]"
+  9dec_msg [9msg_number Tversion] [9bin_range $buf 7 end] rmsg
   parray rmsg
 }
 
