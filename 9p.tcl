@@ -390,8 +390,6 @@ proc 9send_msg {msgvar chan sync code} {
   }
   set key $chan/handler/$m(tag)
   set 9ctx($key) [list 9recv_async $msgvar $chan $m(type) $code1]
-  puts_log dbg \
-           ">>>>([9bin_len $buf]): [string range [hexdump $buf] 0 32]"
   puts_log data ">>>>([9bin_len $buf]): [hexdump $buf]"
   puts -nonewline $chan $buf
   flush $chan
@@ -608,7 +606,6 @@ proc 9write {chan fid offset data {cmd ""}} {
   set msg(fid) $fid
   set msg(offset) $offset
   set msg(data) $data
-  puts_log dbg "write off: $msg(offset) count: [9bin_len $msg(data)]"
   set sync [expr {$cmd eq {}}]
   if {$cmd eq {}} {
     set cmd {
