@@ -89,8 +89,8 @@ set 9session_vars {msize 4096
 
 array set 9open_modes [list r $9p(OREAD) \
                             r+ $9p(ORDWR) \
-                            w $9p(OWRITE) \
-                            w+ $9p(ORDWR) \
+                            w [expr {$9p(OWRITE) | $9p(OTRUNC)}] \
+                            w+ [expr {$9p(ORDWR) | $9p(OTRUNC)}] \
                             a $9p(OWRITE) \
                             a+ $9p(ORDWR)]
 
@@ -101,11 +101,11 @@ array set 9chan_open_modes {r {read}
                             a {write}
                             a+ {read write}}
 
-set 9log_tags {connection !data dbg}
+array set 9log_tags {connection 1 dbg 1 data 0}
 
 proc puts_log {tag msg} {
   global 9log_tags
-  if {[lsearch $9log_tags $tag] >= 0} {
+  if {[info exists 9log_tags($tag)] && $9log_tags($tag)} {
     puts stderr "# $tag: $msg"
     flush stderr
   }
@@ -745,15 +745,15 @@ proc 9file_read {file {size ""}} {
   return $data
 }
 
-proc 9file_read_handler {file id off size var cmd} {
+proc 9file_read_handler {file off size var cmd} {
   global 9ctx
   upvar 1 $var msg
   if {[info exists msg(ename)]} {
     return -code error "9p error: $msg(ename)"
   }
   9file_ctx $file file chan fid
-  incr 9ctx($chan/file/$fid/off) [9bin_len $m(data)]
-  append 9ctx($chan/file/$fid/inbuf) $m(data)
+  incr 9ctx($chan/file/$fid/off) [9bin_len $msg(data)]
+  append 9ctx($chan/file/$fid/inbuf) $msg(data)
   set 9ctx($chan/file/$fid/inside_readable) 1
   uplevel #0 $cmd
   unset -nocomplain 9ctx($chan/file/$fid/inside_readable)
@@ -776,7 +776,7 @@ proc 9file_readable {file args} {
     set off $9ctx($chan/file/$fid/off)
     set size [expr $9ctx($chan/file/$fid/iounit)]
     set c [list 9file_read_handler $file $off $size msg $cmd]
-    set tag [9read $chan $fid $off $c]
+    set tag [9read $chan $fid $off $size $c]
   } else {
     vwait 9ctx($chan/file/$fid/inbuf)
   }
