@@ -1,7 +1,11 @@
-9ptcl
-=====
-9P2000 protocol implementation for 9p.
+# 9ptcl
+9P2000 protocol implementation for tcl.
 
-Features (already implemented or almost implemented):
-  - support for asynchronous operations,
-  - works in jimtcl.
+Features:
+  - support of asynchronous operations,
+  - fileevent support,
+  - works both in tcl and jimtcl (binary extension required).
+
+## TODO
+  - documentation,
+  - tcl vfs support.
